@@ -1,0 +1,215 @@
+name: Anchor Program CI
+run-name: ${{ github.actor }} triggered Anchor CI pipeline
+
+on:
+  push:
+    branches: [ main, develop, gh-actions ]
+  pull_request:
+    branches: [ main, develop, gh-actions ]
+
+env:
+  SOLANA_VERSION: "1.18.24"
+  ANCHOR_VERSION: "0.30.1"
+  RUST_TOOLCHAIN: "1.79.0"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      token-address: ${{ steps.spl-token.outputs.token-address }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          override: true
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Solana
+        uses: actions/cache@v4
+        id: cache-solana
+        with:
+          path: |
+            ~/.local/share/solana/
+            ~/.config/solana/
+          key: ${{ runner.os }}-solana-${{ env.SOLANA_VERSION }}
+
+      - name: Cache Anchor
+        uses: actions/cache@v4
+        id: cache-anchor
+        with:
+          path: ~/.cargo/bin/anchor
+          key: ${{ runner.os }}-anchor-${{ env.ANCHOR_VERSION }}
+
+      - name: Install Solana
+        if: steps.cache-solana.outputs.cache-hit != 'true'
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          echo "/home/runner/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+          solana --version
+
+      - name: Install Anchor
+        if: steps.cache-anchor.outputs.cache-hit != 'true'
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli --locked
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+
+      - name: Install Node dependencies
+        run: yarn install
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Restore caches
+      - name: Restore Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Restore Solana cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/solana/
+            ~/.config/solana/
+          key: ${{ runner.os }}-solana-${{ env.SOLANA_VERSION }}
+
+      - name: Build Anchor program
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          anchor build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: program-artifacts
+          path: |
+            target/deploy/
+            target/types/
+
+  test:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Add Node.js setup
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+
+      # Install dependencies
+      - name: Install Node.js dependencies
+        run: yarn install
+
+      # Restore caches and artifacts
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: program-artifacts
+          path: target/
+
+      - name: Restore Solana cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/solana/
+            ~/.config/solana/
+          key: ${{ runner.os }}-solana-${{ env.SOLANA_VERSION }}
+
+      # Add Anchor cache restoration
+      - name: Restore Anchor cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/anchor
+          key: ${{ runner.os }}-anchor-${{ env.ANCHOR_VERSION }}
+
+      # Add Rust cache restoration since anchor depends on it
+      - name: Restore Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Install Anchor if cache miss
+      - name: Install Anchor if needed
+        run: |
+          if ! command -v anchor &> /dev/null; then
+            cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} anchor-cli --locked
+          fi
+
+      - name: Start Solana validator
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          solana-test-validator -r &
+          sleep 5
+          solana config set --url http://localhost:8899
+
+      - name: Setup Solana keypair
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          if [ ! -f ~/.config/solana/id.json ]; then
+            solana-keygen new --no-bip39-passphrase -o ~/.config/solana/id.json
+          fi
+          solana config set --keypair ~/.config/solana/id.json
+          solana airdrop 10
+
+      - name: Initialize SPL token
+        id: spl-token
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          chmod +x scripts/spl-token.sh
+          TOKEN_ADDRESS=$(sh scripts/spl-token.sh | grep "Token address:" | awk '{print $NF}')
+          echo "token-address=${TOKEN_ADDRESS}" >> $GITHUB_OUTPUT
+          
+          sed -i "s/pub const TOKEN_ID: Pubkey = pubkey!(\"[^\"]*\")/pub const TOKEN_ID: Pubkey = pubkey!(\"${TOKEN_ADDRESS}\")/g" programs/wager-program/src/lib.rs
+          sed -i "s/export const TOKEN_ID = new PublicKey(\"[^\"]*\")/export const TOKEN_ID = new PublicKey(\"${TOKEN_ADDRESS}\")/g" tests/utils.ts
+
+      - name: Deploy and sync program
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          anchor deploy
+          anchor keys sync
+
+      - name: Run tests
+        run: |
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
+          anchor test --skip-local-validator
+
+      - name: Stop validator
+        if: always()
+        run: pkill solana-test-validator || true

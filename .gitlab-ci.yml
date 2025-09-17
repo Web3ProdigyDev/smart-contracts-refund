@@ -1,0 +1,123 @@
+image: ubuntu:latest
+
+variables:
+  SOLANA_VERSION: "1.18.24"
+  ANCHOR_VERSION: "0.30.1"
+  RUST_TOOLCHAIN: "1.79.0"
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+
+# Define cache templates
+.cargo_cache: &cargo_cache
+  key: ${CI_COMMIT_REF_SLUG}-cargo
+  paths:
+    - .cargo/bin/
+    - .cargo/registry/index/
+    - .cargo/registry/cache/
+    - .cargo/git/db/
+  policy: pull-push
+
+.solana_cache: &solana_cache
+  key: ${CI_COMMIT_REF_SLUG}-solana-${SOLANA_VERSION}
+  paths:
+    - .local/share/solana/
+    - .config/solana/
+  policy: pull-push
+
+.anchor_cache: &anchor_cache
+  key: ${CI_COMMIT_REF_SLUG}-anchor-${ANCHOR_VERSION}
+  paths:
+    - .cargo/bin/anchor
+  policy: pull-push
+
+.node_modules_cache: &node_modules_cache
+  key: ${CI_COMMIT_REF_SLUG}-node-modules
+  paths:
+    - node_modules/
+  policy: pull-push
+
+stages:
+  - setup
+  - build
+  - test
+
+setup:
+  stage: setup
+  cache:
+    - <<: *cargo_cache
+    - <<: *solana_cache
+    - <<: *anchor_cache
+    - <<: *node_modules_cache
+  script:
+    # Install basic dependencies
+    - apt-get update && apt-get install -y curl git build-essential nodejs npm
+    - npm install -g yarn
+
+    # Install Rust
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN}
+    - source $CARGO_HOME/env
+    - rustup component add rustfmt clippy
+
+    # Install Solana
+    - sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+    - export PATH="/root/.local/share/solana/install/active_release/bin:$PATH"
+    - solana --version
+
+    # Install Anchor
+    - cargo install --git https://github.com/coral-xyz/anchor --tag v${ANCHOR_VERSION} anchor-cli --locked
+
+    # Install Node dependencies
+    - yarn install
+
+build:
+  stage: build
+  needs: [setup]
+  cache:
+    - <<: *cargo_cache
+    - <<: *solana_cache
+    - <<: *anchor_cache
+  script:
+    - source $CARGO_HOME/env
+    - export PATH="/root/.local/share/solana/install/active_release/bin:$PATH"
+    - anchor build
+  artifacts:
+    paths:
+      - target/deploy/
+      - target/types/
+
+test:
+  stage: test
+  needs: [setup, build]
+  cache:
+    - <<: *cargo_cache
+    - <<: *solana_cache
+    - <<: *anchor_cache
+    - <<: *node_modules_cache
+  script:
+    # Setup environment
+    - source $CARGO_HOME/env
+    - export PATH="/root/.local/share/solana/install/active_release/bin:$PATH"
+    
+    # Start Solana validator
+    - solana-test-validator -r &
+    - sleep 5
+    - solana config set --url http://localhost:8899
+
+    # Setup Solana keypair
+    - solana-keygen new --no-bip39-passphrase -o ~/.config/solana/id.json
+    - solana config set --keypair ~/.config/solana/id.json
+    - solana airdrop 10
+
+    # Initialize SPL token and update configuration
+    - |
+      chmod +x scripts/spl-token.sh
+      TOKEN_ADDRESS=$(sh scripts/spl-token.sh | grep "Token address:" | awk '{print $NF}')
+      sed -i "s/pub const TOKEN_ID: Pubkey = pubkey!(\"[^\"]*\")/pub const TOKEN_ID: Pubkey = pubkey!(\"${TOKEN_ADDRESS}\")/g" programs/wager-program/src/lib.rs
+      sed -i "s/export const TOKEN_ID = new PublicKey(\"[^\"]*\")/export const TOKEN_ID = new PublicKey(\"${TOKEN_ADDRESS}\")/g" tests/utils.ts
+
+    # Deploy and test
+    - anchor deploy
+    - anchor keys sync
+    - anchor test --skip-local-validator
+  after_script:
+    - pkill solana-test-validator || true
+
