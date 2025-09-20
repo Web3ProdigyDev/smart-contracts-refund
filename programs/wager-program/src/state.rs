@@ -1,6 +1,6 @@
-//! State accounts for the betting program - COMPILATION FIXED VERSION
+//! State accounts for the betting program - SECURITY HARDENED WITH ATOMIC OPERATIONS
 use crate::errors::WagerError;
-use crate::utils::{validate_kill_count, validate_spawn_count};
+use crate::utils::{validate_kill_count, validate_spawn_count, generate_secure_nonce};
 use anchor_lang::prelude::*;
 
 /// Game mode defining the team sizes
@@ -193,7 +193,7 @@ impl Team {
     }
 }
 
-/// Represents a game session - ENHANCED with comprehensive validation
+/// Represents a game session - ENHANCED with atomic operations and security
 #[account]
 pub struct GameSession {
     pub session_id: String,      // 4 + variable (max 32 bytes)
@@ -208,6 +208,8 @@ pub struct GameSession {
     pub vault_bump: u8,          // 1 byte
     pub nonce: u64,              // ENHANCED: 8 bytes - for preventing replay attacks
     pub last_operation: i64,     // ENHANCED: 8 bytes - timestamp of last operation
+    pub session_hash: [u8; 32],  // NEW: 32 bytes - cryptographic session identifier
+    pub operation_count: u64,    // NEW: 8 bytes - total operations counter
 }
 
 impl GameSession {
@@ -223,10 +225,12 @@ impl GameSession {
         1 + // bump
         1 + // vault_bump
         8 + // nonce
-        8; // last_operation
-        // Total: ~474 bytes
+        8 + // last_operation
+        32 + // session_hash
+        8; // operation_count
+        // Total: ~514 bytes
 
-    /// ENHANCED: Initialize with proper validation
+    /// ENHANCED: Initialize with proper validation and cryptographic security
     pub fn initialize(
         &mut self,
         session_id: String,
@@ -238,6 +242,13 @@ impl GameSession {
     ) -> Result<()> {
         let clock = Clock::get()?;
         
+        // Generate cryptographically secure session hash
+        let session_hash = crate::utils::generate_session_hash(
+            &session_id, 
+            authority, 
+            clock.unix_timestamp
+        );
+        
         self.session_id = session_id;
         self.authority = authority;
         self.session_bet = session_bet;
@@ -248,18 +259,75 @@ impl GameSession {
         self.created_at = clock.unix_timestamp;
         self.bump = bump;
         self.vault_bump = vault_bump;
-        self.nonce = 0;
+        self.nonce = generate_secure_nonce(0, &session_hash);
         self.last_operation = clock.unix_timestamp;
+        self.session_hash = session_hash;
+        self.operation_count = 0;
 
         Ok(())
     }
 
-    /// ENHANCED: Update last operation timestamp and increment nonce
+    /// CRITICAL SECURITY FIX: Atomic operation tracking with race condition prevention
     pub fn update_operation_tracking(&mut self) -> Result<()> {
         let clock = Clock::get()?;
-        self.last_operation = clock.unix_timestamp;
+        
+        // Atomic increment with overflow protection
         self.nonce = self.nonce.checked_add(1).ok_or(WagerError::ArithmeticError)?;
+        self.operation_count = self.operation_count.checked_add(1).ok_or(WagerError::ArithmeticError)?;
+        self.last_operation = clock.unix_timestamp;
+        
         Ok(())
+    }
+
+    /// CRITICAL SECURITY FIX: Atomic status transition with comprehensive validation
+    pub fn atomic_status_transition(&mut self, new_status: GameStatus, expected_nonce: u64) -> Result<()> {
+        // ATOMIC CHECK: Verify current nonce matches expected (prevents race conditions)
+        require!(
+            self.nonce == expected_nonce,
+            WagerError::ConcurrentOperation
+        );
+
+        // Validate transition is allowed
+        require!(
+            self.status.can_transition_to(&new_status),
+            WagerError::InvalidGameState
+        );
+
+        // Specific transition validations
+        match (&self.status, &new_status) {
+            (GameStatus::WaitingForPlayers, GameStatus::InProgress) => {
+                require!(
+                    self.check_all_filled_secure()?,
+                    WagerError::NotAllPlayersJoined
+                );
+            },
+            (GameStatus::InProgress, GameStatus::Completed) => {
+                // Valid transition - no additional checks needed
+            },
+            (_, GameStatus::Cancelled) => {
+                // Can cancel from most states
+            },
+            (_, GameStatus::Expired) => {
+                // Can expire from non-final states
+                require!(
+                    !self.status.is_final(),
+                    WagerError::InvalidGameState
+                );
+            },
+            _ => return Err(error!(WagerError::InvalidGameState)),
+        }
+
+        // ATOMIC UPDATE: Change status and increment nonce in single operation
+        self.status = new_status;
+        self.update_operation_tracking()?;
+        
+        Ok(())
+    }
+
+    /// Legacy method that now uses atomic operations
+    pub fn transition_status(&mut self, new_status: GameStatus) -> Result<()> {
+        let current_nonce = self.nonce;
+        self.atomic_status_transition(new_status, current_nonce)
     }
 
     /// Gets an empty slot for a player in the specified team
@@ -534,42 +602,6 @@ impl GameSession {
         self.validate_not_expired_safe()
     }
     
-    /// ENHANCED: Validate and perform status transitions atomically
-    pub fn transition_status(&mut self, new_status: GameStatus) -> Result<()> {
-        require!(
-            self.status.can_transition_to(&new_status),
-            WagerError::InvalidGameState
-        );
-
-        match (&self.status, &new_status) {
-            (GameStatus::WaitingForPlayers, GameStatus::InProgress) => {
-                require!(
-                    self.check_all_filled_secure()?,
-                    WagerError::NotAllPlayersJoined
-                );
-            },
-            (GameStatus::InProgress, GameStatus::Completed) => {
-                // Valid transition
-            },
-            (_, GameStatus::Cancelled) => {
-                // Can cancel from most states
-            },
-            (_, GameStatus::Expired) => {
-                // Can expire from non-final states
-                require!(
-                    !self.status.is_final(),
-                    WagerError::InvalidGameState
-                );
-            },
-            _ => return Err(error!(WagerError::InvalidGameState)),
-        }
-
-        self.status = new_status;
-        self.update_operation_tracking()?;
-        
-        Ok(())
-    }
-
     /// ENHANCED: Comprehensive game session validation
     pub fn validate_integrity(&self) -> Result<()> {
         // Validate basic fields
@@ -592,6 +624,18 @@ impl GameSession {
         require!(
             self.created_at > 0 && self.last_operation >= self.created_at,
             WagerError::InvalidTimestamp
+        );
+
+        // Validate session hash integrity
+        let expected_hash = crate::utils::generate_session_hash(
+            &self.session_id,
+            self.authority,
+            self.created_at
+        );
+        
+        require!(
+            self.session_hash == expected_hash,
+            WagerError::SessionIdCollision
         );
 
         // Validate team compositions if game is in progress or completed

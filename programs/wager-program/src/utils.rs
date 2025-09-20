@@ -1,6 +1,7 @@
 // utils.rs - ENHANCED SESSION ID VALIDATION AND SHARED FUNCTIONS (SECURITY HARDENED)
 use anchor_lang::prelude::*;
 use crate::errors::WagerError;
+use sha2::{Sha256, Digest};
 
 /// CRITICAL FIX: Enhanced session ID validation with collision-resistant patterns
 pub fn validate_session_id(session_id: &str) -> Result<()> {
@@ -255,26 +256,64 @@ pub fn validate_kill_count(current_kills: u8) -> Result<()> {
     Ok(())
 }
 
-/// NEW: Generate collision-resistant session validation hash
+/// CRITICAL SECURITY FIX: Generate cryptographically secure session validation hash
+/// Replaced DefaultHasher with SHA-256 for collision resistance
 pub fn generate_session_hash(session_id: &str, authority: Pubkey, timestamp: i64) -> [u8; 32] {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = Sha256::new();
     
-    // Include multiple entropy sources
-    std::hash::Hash::hash(&session_id, &mut hasher);
-    std::hash::Hash::hash(&authority.to_bytes(), &mut hasher);
-    std::hash::Hash::hash(&timestamp, &mut hasher);
-    std::hash::Hash::hash(&"WAGER_SESSION_V1", &mut hasher);
+    // Include multiple entropy sources with secure hashing
+    hasher.update(b"WAGER_SESSION_V2_"); // Version prefix
+    hasher.update(session_id.as_bytes());
+    hasher.update(&authority.to_bytes());
+    hasher.update(&timestamp.to_le_bytes());
     
-    let hash_value = std::hash::Hasher::finish(&hasher);
-    
-    // Convert hash to 32-byte array
-    let mut result = [0u8; 32];
-    result[..8].copy_from_slice(&hash_value.to_le_bytes());
-    
-    // Fill remainder with derived values for full 32 bytes
-    for i in 8..32 {
-        result[i] = (hash_value.wrapping_shr((i * 8) as u32) ^ timestamp as u64) as u8;
+    // Add additional entropy from clock if available
+    if let Ok(clock) = Clock::get() {
+        hasher.update(&clock.slot.to_le_bytes());
+        hasher.update(&clock.epoch.to_le_bytes());
     }
     
-    result
+    // Add program ID for domain separation
+    hasher.update(&crate::ID.to_bytes());
+    
+    // Finalize with cryptographic hash
+    hasher.finalize().into()
+}
+
+/// NEW: Verify session hash integrity
+pub fn verify_session_hash(
+    stored_hash: &[u8; 32], 
+    session_id: &str, 
+    authority: Pubkey, 
+    timestamp: i64
+) -> Result<()> {
+    let computed_hash = generate_session_hash(session_id, authority, timestamp);
+    
+    require!(
+        stored_hash == &computed_hash,
+        WagerError::SessionIdCollision
+    );
+    
+    Ok(())
+}
+
+/// NEW: Generate cryptographically secure nonce
+pub fn generate_secure_nonce(base_nonce: u64, additional_entropy: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    
+    hasher.update(&base_nonce.to_le_bytes());
+    hasher.update(additional_entropy);
+    
+    if let Ok(clock) = Clock::get() {
+        hasher.update(&clock.unix_timestamp.to_le_bytes());
+        hasher.update(&clock.slot.to_le_bytes());
+    }
+    
+    let hash_result = hasher.finalize();
+    
+    // Use first 8 bytes of hash as secure nonce
+    u64::from_le_bytes([
+        hash_result[0], hash_result[1], hash_result[2], hash_result[3],
+        hash_result[4], hash_result[5], hash_result[6], hash_result[7],
+    ])
 }

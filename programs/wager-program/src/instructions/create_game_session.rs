@@ -17,7 +17,7 @@ pub fn create_game_session_handler(
     validate_session_id(&session_id)?;
     validate_bet_amount(bet_amount)?;
     
-    // ENHANCED: Additional collision prevention - generate unique hash for session
+    // ENHANCED: Additional collision prevention - generate cryptographically secure hash for session
     let clock = Clock::get()?;
     let session_hash = generate_session_hash(&session_id, ctx.accounts.game_server.key(), clock.unix_timestamp);
     

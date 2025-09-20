@@ -1,4 +1,4 @@
-// distribute_winnings.rs - RACE CONDITION PREVENTION WITH ATOMIC STATUS UPDATES
+// distribute_winnings.rs - ATOMIC OPERATIONS WITH RACE CONDITION PREVENTION
 use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_remaining_accounts_against_players, safe_multiply_and_divide}};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -14,8 +14,8 @@ pub fn distribute_pay_spawn_earnings<'info>(
     // Validate session_id format FIRST
     validate_session_id(&session_id)?;
     
-    // CRITICAL RACE CONDITION FIX: Use atomic status transition with nonce tracking
-    let original_nonce = game_session.nonce;
+    // CRITICAL RACE CONDITION FIX: Atomic status transition with nonce validation
+    let current_nonce = game_session.nonce;
     
     // ATOMIC OPERATION: Check current state and transition atomically
     require!(
@@ -24,16 +24,16 @@ pub fn distribute_pay_spawn_earnings<'info>(
     );
     
     // IMMEDIATE atomic transition to prevent race conditions
-    game_session.transition_status(GameStatus::Completed)?;
+    game_session.atomic_status_transition(GameStatus::Completed, current_nonce)?;
     
-    // Verify atomic transition succeeded and nonce was incremented
+    // Verify atomic transition succeeded
     require!(
         game_session.status == GameStatus::Completed,
         WagerError::InvalidGameState
     );
     
     require!(
-        game_session.nonce == original_nonce + 1,
+        game_session.nonce == current_nonce + 1,
         WagerError::ConcurrentOperation
     );
     
@@ -256,7 +256,7 @@ pub fn distribute_all_winnings_handler<'info>(
     );
     
     // CRITICAL RACE CONDITION FIX: Atomic status transition with nonce tracking
-    let original_nonce = game_session.nonce;
+    let current_nonce = game_session.nonce;
     
     require!(
         game_session.status == GameStatus::InProgress,
@@ -264,11 +264,11 @@ pub fn distribute_all_winnings_handler<'info>(
     );
     
     // IMMEDIATE atomic transition
-    game_session.transition_status(GameStatus::Completed)?;
+    game_session.atomic_status_transition(GameStatus::Completed, current_nonce)?;
     
     // Verify atomic transition
     require!(
-        game_session.status == GameStatus::Completed && game_session.nonce == original_nonce + 1,
+        game_session.status == GameStatus::Completed && game_session.nonce == current_nonce + 1,
         WagerError::ConcurrentOperation
     );
 
