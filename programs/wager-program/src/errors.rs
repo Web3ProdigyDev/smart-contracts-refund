@@ -1,3 +1,4 @@
+// errors.rs - UPDATED WITH NEW SECURITY ERROR TYPES INCLUDING TIMESTAMP VALIDATION
 use anchor_lang::prelude::*;
 
 #[error_code]
@@ -88,4 +89,45 @@ pub enum WagerError {
 
     #[msg("Game is not in progress")]
     GameNotInProgress,
+
+    // NEW CRITICAL SECURITY ERROR TYPES
+    #[msg("Invalid session ID format - must be alphanumeric with underscores/hyphens only")]
+    InvalidSessionId,
+
+    #[msg("Vault has insufficient funds for operation")]
+    InsufficientVaultFunds,
+
+    #[msg("Game session already completed - no further operations allowed")]
+    AlreadyCompleted,
+
+    #[msg("Cross-team kills only - cannot kill teammates")]
+    InvalidKillTarget,
+
+    #[msg("Spawn purchase limit exceeded")]
+    SpawnLimitExceeded,
+
+    #[msg("Game session expired")]
+    SessionExpired,
+
+    #[msg("Emergency pause is active")]
+    EmergencyPaused,
+
+    #[msg("Invalid token program provided")]
+    InvalidTokenProgram,
+
+    #[msg("Account substitution detected")]
+    AccountSubstitution,
+
+    #[msg("Duplicate player detected")]
+    DuplicatePlayer,
+
+    #[msg("Game timeout exceeded")]
+    GameTimeout,
+
+    #[msg("Invalid bet amount - must be between minimum and maximum limits")]
+    InvalidBetAmount,
+
+    // ADDED: Timestamp validation error for safe arithmetic
+    #[msg("Invalid timestamp - negative or zero timestamps not allowed")]
+    InvalidTimestamp,
 }

@@ -1,4 +1,5 @@
-use crate::{errors::WagerError, state::*, TOKEN_ID};
+// refund_wager.rs - SECURITY HARDENED VERSION
+use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_remaining_accounts_against_players}};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
@@ -7,65 +8,93 @@ pub fn refund_wager_handler<'info>(
     ctx: Context<'_, '_, 'info, 'info, RefundWager<'info>>,
     session_id: String,
 ) -> Result<()> {
-    let game_session = &ctx.accounts.game_session;
+    let game_session = &mut ctx.accounts.game_session;
+    let vault_bump = game_session.vault_bump; // Store vault_bump early
+    
+    // Validate session_id format
+    validate_session_id(&session_id)?;
+    
     msg!("Starting Refund for session: {}", session_id);
 
-    let players = game_session.get_all_players();
-    msg!("Number of players: {}", players.len());
-    msg!(
-        "Number of remaining accounts: {}",
-        ctx.remaining_accounts.len()
+    // CRITICAL FIX: Only allow refunds for games that are not completed
+    // and ensure we don't double-refund
+    require!(
+        game_session.status != GameStatus::Completed,
+        WagerError::InvalidGameState
     );
+    
+    // Mark as completed FIRST to prevent double refunds
+    game_session.status = GameStatus::Completed;
 
-    // We need at least one player and their token account
+    let players = game_session.get_all_players();
+    let active_players: Vec<Pubkey> = players
+        .into_iter()
+        .filter(|p| *p != Pubkey::default())
+        .collect();
+        
+    msg!("Number of active players: {}", active_players.len());
+    msg!("Number of remaining accounts: {}", ctx.remaining_accounts.len());
+
+    // Enhanced validation for remaining accounts
     require!(
         !ctx.remaining_accounts.is_empty(),
         WagerError::InvalidRemainingAccounts
     );
 
-    // Make sure remaining accounts are in pairs
     require!(
         ctx.remaining_accounts.len() % 2 == 0,
         WagerError::InvalidRemainingAccounts
     );
 
-    for player in players {
-        // Skip default player
-        if player == Pubkey::default() {
-            continue;
-        }
+    // CRITICAL FIX: Calculate total refund needed and verify vault balance
+    let refund_amount = game_session.session_bet;
+    let total_refund = refund_amount
+        .checked_mul(active_players.len() as u64)
+        .ok_or(WagerError::ArithmeticError)?;
+        
+    require!(
+        ctx.accounts.vault_token_account.amount >= total_refund,
+        WagerError::InsufficientVaultFunds
+    );
+    
+    msg!("Total refund required: {}, Vault balance: {}", total_refund, ctx.accounts.vault_token_account.amount);
 
-        let refund = game_session.session_bet;
-        msg!("Earnings for player {}: {}", player, refund);
+    // CRITICAL FIX: Validate remaining accounts match active players
+    validate_remaining_accounts_against_players(&ctx.remaining_accounts, &active_players)?;
 
-        // Find the player's account and token account in remaining_accounts
+    for player in active_players {
+        msg!("Processing refund for player: {}", player);
+
+        // CRITICAL FIX: Strict player account lookup
         let player_index = ctx
             .remaining_accounts
             .iter()
-            .step_by(2) // Skip token accounts to only look at player accounts
+            .step_by(2)
             .position(|acc| acc.key() == player)
             .ok_or(WagerError::InvalidPlayer)?;
 
-        // Get player and token account from remaining accounts
         let player_account = &ctx.remaining_accounts[player_index * 2];
         let player_token_account_info = &ctx.remaining_accounts[player_index * 2 + 1];
         let player_token_account = Account::<TokenAccount>::try_from(player_token_account_info)?;
 
-        // Verify player token account constraints
+        // CRITICAL FIX: Comprehensive token account validation
         require!(
             player_token_account.owner == player_account.key(),
             WagerError::InvalidPlayerTokenAccount
         );
 
-        // Verify token account mint
         require!(
             player_token_account.mint == TOKEN_ID,
             WagerError::InvalidTokenMint
         );
 
-        // Get vault balance before transfer
-        let vault_balance = ctx.accounts.vault_token_account.amount;
-        msg!("Vault balance before transfer: {}", vault_balance);
+        // CRITICAL FIX: Verify account identity
+        require!(
+            player_account.key() == player,
+            WagerError::InvalidPlayer
+        );
+
+        msg!("Refunding {} to player {}", refund_amount, player);
 
         // Transfer tokens from vault to player
         anchor_spl::token::transfer(
@@ -79,19 +108,16 @@ pub fn refund_wager_handler<'info>(
                 &[&[
                     b"vault",
                     session_id.as_bytes(),
-                    &[ctx.accounts.game_session.vault_bump],
+                    &[vault_bump],
                 ]],
             ),
-            refund,
+            refund_amount,
         )?;
     }
 
-    // Mark session as completed
-    let game_session = &mut ctx.accounts.game_session;
-    game_session.status = GameStatus::Completed;
-
     Ok(())
 }
+
 #[derive(Accounts)]
 #[instruction(session_id: String)]
 pub struct RefundWager<'info> {

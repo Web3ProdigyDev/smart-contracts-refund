@@ -1,10 +1,14 @@
-use crate::{errors::WagerError, state::*, TOKEN_ID};
+// join_user.rs - SECURITY HARDENED VERSION
+use crate::{errors::WagerError, state::*, TOKEN_ID, utils::validate_session_id};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
 
-pub fn join_user_handler(ctx: Context<JoinUser>, _session_id: String, team: u8) -> Result<()> {
+pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -> Result<()> {
     let game_session = &mut ctx.accounts.game_session;
+    
+    // CRITICAL FIX: Validate session_id format
+    validate_session_id(&session_id)?;
 
     // Validate game status
     require!(
@@ -15,10 +19,34 @@ pub fn join_user_handler(ctx: Context<JoinUser>, _session_id: String, team: u8) 
     // Validate team number (0 for team A, 1 for team B)
     require!(team == 0 || team == 1, WagerError::InvalidTeamSelection);
 
+    // CRITICAL FIX: Check for duplicate players across both teams
+    let player_key = ctx.accounts.user.key();
+    require!(
+        !game_session.is_player_already_joined(player_key)?,
+        WagerError::DuplicatePlayer
+    );
+
     // Check if team is full already
     let empty_index = game_session.get_player_empty_slot(team)?;
 
     let session_bet = game_session.session_bet;
+    
+    // CRITICAL FIX: Verify user has sufficient balance before transfer
+    require!(
+        ctx.accounts.user_token_account.amount >= session_bet,
+        WagerError::InsufficientFunds
+    );
+
+    // CRITICAL FIX: Verify token account ownership and mint
+    require!(
+        ctx.accounts.user_token_account.owner == ctx.accounts.user.key(),
+        WagerError::InvalidPlayerTokenAccount
+    );
+    
+    require!(
+        ctx.accounts.user_token_account.mint == TOKEN_ID,
+        WagerError::InvalidTokenMint
+    );
 
     // Transfer SPL tokens from user to vault using user's signature
     anchor_spl::token::transfer(
@@ -33,8 +61,6 @@ pub fn join_user_handler(ctx: Context<JoinUser>, _session_id: String, team: u8) 
         session_bet,
     )?;
 
-    let player = ctx.accounts.user.key();
-
     // Get reference to the selected team
     let selected_team = if team == 0 {
         &mut game_session.team_a
@@ -43,13 +69,21 @@ pub fn join_user_handler(ctx: Context<JoinUser>, _session_id: String, team: u8) 
     };
 
     // Add player to the first available slot
-    selected_team.players[empty_index] = player.key();
+    selected_team.players[empty_index] = player_key;
     selected_team.player_spawns[empty_index] = 10;
     selected_team.player_kills[empty_index] = 0;
+    
+    // CRITICAL FIX: Update team's total bet tracking
+    selected_team.total_bet = selected_team.total_bet
+        .checked_add(session_bet)
+        .ok_or(WagerError::ArithmeticError)?;
 
+    // Check if both teams are full and update status atomically
     if game_session.check_all_filled()? {
         game_session.status = GameStatus::InProgress;
     }
+
+    msg!("Player {} joined team {} at position {}", player_key, team, empty_index);
 
     Ok(())
 }
@@ -97,6 +131,7 @@ pub struct JoinUser<'info> {
         address = TOKEN_ID @ WagerError::InvalidMint
     )]
     pub mint: Account<'info, anchor_spl::token::Mint>,
+    
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,

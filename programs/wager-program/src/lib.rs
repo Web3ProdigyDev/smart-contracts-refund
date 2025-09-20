@@ -1,3 +1,4 @@
+// lib.rs
 use anchor_lang::prelude::*;
 
 pub mod errors;

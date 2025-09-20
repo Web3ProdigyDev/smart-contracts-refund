@@ -1,6 +1,8 @@
+// create_game_session.rs - SECURITY HARDENED VERSION
 use crate::errors::WagerError;
 use crate::state::*;
 use crate::TOKEN_ID;
+use crate::utils::validate_session_id;
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
@@ -11,10 +13,20 @@ pub fn create_game_session_handler(
     bet_amount: u64,
     game_mode: GameMode,
 ) -> Result<()> {
+    // CRITICAL FIX: Validate session_id format before any other operations
+    validate_session_id(&session_id)?;
+    
+    // CRITICAL FIX: Validate bet amount is reasonable (min 1000, max 1M tokens)
+    require!(
+        bet_amount >= 1000 && bet_amount <= 1_000_000_000_000, // 1M tokens with 6 decimals
+        WagerError::InvalidBetAmount
+    );
+    
     let clock = Clock::get()?;
     let game_session = &mut ctx.accounts.game_session;
 
-    game_session.session_id = session_id;
+    // CRITICAL FIX: Initialize with proper validation
+    game_session.session_id = session_id.clone();
     game_session.authority = ctx.accounts.game_server.key();
     game_session.session_bet = bet_amount;
     game_session.game_mode = game_mode;
@@ -22,14 +34,18 @@ pub fn create_game_session_handler(
     game_session.created_at = clock.unix_timestamp;
     game_session.bump = ctx.bumps.game_session;
     game_session.vault_bump = ctx.bumps.vault;
+    
+    // CRITICAL FIX: Initialize teams with default values explicitly
+    game_session.team_a = Team::default();
+    game_session.team_b = Team::default();
 
-    // Log all the accounts
+    msg!("Game session created with ID: {}", session_id);
+    msg!("Bet amount: {}", bet_amount);
+    msg!("Game mode: {:?}", game_mode);
     msg!("Game session: {}", game_session.key());
     msg!("Vault: {}", ctx.accounts.vault.key());
-    msg!(
-        "Vault token account: {}",
-        ctx.accounts.vault_token_account.key()
-    );
+    msg!("Vault token account: {}", ctx.accounts.vault_token_account.key());
+    
     Ok(())
 }
 
@@ -42,7 +58,7 @@ pub struct CreateGameSession<'info> {
     #[account(
         init,
         payer = game_server,
-        space = 8 + 4 + 10 + 32 + 8 + 1 + (2 * (32 * 5 + 16 * 5 + 16 * 5 + 8)) + 1 + 8 + 1 + 1 + 1,
+        space = GameSession::MAX_SIZE,
         seeds = [b"game_session", session_id.as_bytes()],
         bump
     )]
