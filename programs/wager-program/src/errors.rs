@@ -1,4 +1,4 @@
-// errors.rs - UPDATED WITH NEW SECURITY ERROR TYPES INCLUDING TIMESTAMP VALIDATION
+// errors.rs - ENHANCED ERROR TYPES WITH SECURITY CLASSIFICATIONS
 use anchor_lang::prelude::*;
 
 #[error_code]
@@ -90,8 +90,8 @@ pub enum WagerError {
     #[msg("Game is not in progress")]
     GameNotInProgress,
 
-    // NEW CRITICAL SECURITY ERROR TYPES
-    #[msg("Invalid session ID format - must be alphanumeric with underscores/hyphens only")]
+    // ENHANCED SECURITY ERROR TYPES WITH MORE SPECIFIC MESSAGES
+    #[msg("Invalid session ID - must be 12-32 chars, alphanumeric with underscores/hyphens, containing both letters and numbers")]
     InvalidSessionId,
 
     #[msg("Vault has insufficient funds for operation")]
@@ -103,31 +103,106 @@ pub enum WagerError {
     #[msg("Cross-team kills only - cannot kill teammates")]
     InvalidKillTarget,
 
-    #[msg("Spawn purchase limit exceeded")]
+    #[msg("Spawn purchase limit exceeded - maximum 100 spawns per player")]
     SpawnLimitExceeded,
 
-    #[msg("Game session expired")]
+    #[msg("Game session expired - operations not allowed after timeout")]
     SessionExpired,
 
-    #[msg("Emergency pause is active")]
+    #[msg("Emergency pause is active - all operations suspended")]
     EmergencyPaused,
 
     #[msg("Invalid token program provided")]
     InvalidTokenProgram,
 
-    #[msg("Account substitution detected")]
+    #[msg("Account substitution detected - provided account does not match expected")]
     AccountSubstitution,
 
-    #[msg("Duplicate player detected")]
+    #[msg("Duplicate player detected - player already exists in game session")]
     DuplicatePlayer,
 
-    #[msg("Game timeout exceeded")]
+    #[msg("Game timeout exceeded - maximum 24 hours")]
     GameTimeout,
 
-    #[msg("Invalid bet amount - must be between minimum and maximum limits")]
+    #[msg("Invalid bet amount - must be between 0.001 and 1,000,000 tokens")]
     InvalidBetAmount,
 
-    // ADDED: Timestamp validation error for safe arithmetic
     #[msg("Invalid timestamp - negative or zero timestamps not allowed")]
     InvalidTimestamp,
+
+    // NEW ENHANCED ERROR TYPES FOR BETTER SECURITY
+    #[msg("Concurrent operation detected - please retry")]
+    ConcurrentOperation,
+
+    #[msg("Rate limit exceeded - too many operations in short time")]
+    RateLimitExceeded,
+
+    #[msg("Invalid account derivation - PDA seeds do not match")]
+    InvalidAccountDerivation,
+
+    #[msg("Account initialization failed - insufficient rent or invalid parameters")]
+    AccountInitializationFailed,
+
+    #[msg("Token transfer failed - insufficient balance or invalid accounts")]
+    TokenTransferFailed,
+
+    #[msg("Invalid game mode for operation")]
+    InvalidGameModeForOperation,
+
+    #[msg("Player index out of bounds for game mode")]
+    PlayerIndexOutOfBounds,
+
+    #[msg("Invalid kill count - exceeds maximum allowed")]
+    InvalidKillCount,
+
+    #[msg("Session ID collision detected - use different session ID")]
+    SessionIdCollision,
+
+    #[msg("Authority mismatch - signer does not match game authority")]
+    AuthorityMismatch,
+
+    #[msg("Invalid buffer size - account space insufficient")]
+    InvalidBufferSize,
+
+    #[msg("Vault balance mismatch - expected balance does not match actual")]
+    VaultBalanceMismatch,
+
+    #[msg("Invalid spawn increment - must be between 1 and 50")]
+    InvalidSpawnIncrement,
+
+    #[msg("Team composition invalid - incorrect number of players")]
+    InvalidTeamComposition,
+
+    #[msg("Game data corruption detected")]
+    GameDataCorruption,
+
+    #[msg("Invalid account ownership - account owner mismatch")]
+    InvalidAccountOwnership,
+
+    #[msg("Insufficient entropy in session ID - must be more random")]
+    InsufficientEntropy,
+
+    #[msg("Stake amount exceeds maximum allowed per player")]
+    StakeAmountExceeded,
+
+    #[msg("Minimum stake requirement not met")]
+    MinimumStakeNotMet,
+
+    #[msg("Invalid operation sequence - operations must be performed in correct order")]
+    InvalidOperationSequence,
+
+    #[msg("Account freeze detected - operation not allowed")]
+    AccountFrozen,
+
+    #[msg("Invalid signature - transaction not properly signed")]
+    InvalidSignature,
+
+    #[msg("Replay attack detected - nonce already used")]
+    ReplayAttack,
+
+    #[msg("Invalid program version - upgrade required")]
+    InvalidProgramVersion,
+
+    #[msg("Circuit breaker activated - system protection engaged")]
+    CircuitBreakerActivated,
 }
