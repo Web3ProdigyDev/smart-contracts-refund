@@ -1,4 +1,4 @@
-// refund_wager.rs - ATOMIC OPERATIONS SECURITY HARDENED VERSION
+// refund_wager.rs - RACE CONDITION FIXED WITH COMPARE-AND-SWAP OPERATIONS
 use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_remaining_accounts_against_players, safe_add_u64}};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -16,24 +16,47 @@ pub fn refund_wager_handler<'info>(
     
     msg!("Starting Refund for session: {}", session_id);
 
-    // CRITICAL FIX: Atomic status validation and update
-    // Only allow refunds for games that are not completed and ensure no double-refunds
-    require!(
-        game_session.status != GameStatus::Completed,
-        WagerError::InvalidGameState
-    );
-    
-    // ATOMIC OPERATION: Mark as completed IMMEDIATELY to prevent double refunds
-    let original_status = game_session.status.clone();
-    game_session.status = GameStatus::Completed;
-    
-    // Verify atomic update succeeded
-    require!(
-        game_session.status == GameStatus::Completed,
-        WagerError::InvalidGameState
-    );
-    
-    msg!("Game status atomically changed from {:?} to Completed", original_status);
+    // CRITICAL FIX: Use compare-and-swap for atomic refund initiation
+    // This prevents double refunds and race conditions
+    let success = match game_session.status {
+        GameStatus::WaitingForPlayers => {
+            // Can refund from waiting state
+            game_session.compare_and_swap_status(
+                GameStatus::WaitingForPlayers,
+                GameStatus::RefundInProgress,
+                Some("refund_from_waiting")
+            )?
+        },
+        GameStatus::InProgress => {
+            // Can refund from in-progress (emergency refund)
+            game_session.compare_and_swap_status(
+                GameStatus::InProgress,
+                GameStatus::RefundInProgress,
+                Some("emergency_refund")
+            )?
+        },
+        GameStatus::Expired => {
+            // Can refund expired games
+            game_session.compare_and_swap_status(
+                GameStatus::Expired,
+                GameStatus::RefundInProgress,
+                Some("refund_expired")
+            )?
+        },
+        _ => {
+            // Cannot refund from other states
+            msg!("Cannot refund from current status: {:?}", game_session.status);
+            return Err(error!(WagerError::InvalidGameState));
+        }
+    };
+
+    if !success {
+        return Err(error!(WagerError::ConcurrentOperation));
+    }
+
+    // At this point, we've atomically transitioned to RefundInProgress
+    // No other thread can start a refund or distribution
+    msg!("Refund status atomically set to RefundInProgress");
 
     let players = game_session.get_all_players();
     let active_players: Vec<Pubkey> = players
@@ -97,6 +120,7 @@ pub fn refund_wager_handler<'info>(
     let mut total_refunded: u64 = 0;
     let mut successful_refunds: usize = 0;
 
+    // Perform refunds with comprehensive error handling
     for (player_idx, player) in active_players.iter().enumerate() {
         msg!("Processing refund for player: {} (index: {})", player, player_idx);
 
@@ -105,10 +129,7 @@ pub fn refund_wager_handler<'info>(
         let token_account_idx = player_idx * 2 + 1;
         
         require!(
-            player_account_idx < ctx.remaining_accounts.len(),
-            WagerError::InvalidRemainingAccounts
-        );
-        require!(
+            player_account_idx < ctx.remaining_accounts.len() && 
             token_account_idx < ctx.remaining_accounts.len(),
             WagerError::InvalidRemainingAccounts
         );
@@ -137,7 +158,7 @@ pub fn refund_wager_handler<'info>(
              refund_amount, player, player_token_account_info.key());
 
         // Transfer tokens from vault to player with comprehensive error handling
-        anchor_spl::token::transfer(
+        let transfer_result = anchor_spl::token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 anchor_spl::token::Transfer {
@@ -148,12 +169,20 @@ pub fn refund_wager_handler<'info>(
                 &[&[
                     b"vault",
                     session_id.as_bytes(),
-                    ctx.accounts.game_server.key().as_ref(), // Updated seed with authority
+                    ctx.accounts.game_server.key().as_ref(),
                     &[vault_bump],
                 ]],
             ),
             refund_amount,
-        )?;
+        );
+
+        // Handle transfer failure
+        if let Err(e) = transfer_result {
+            msg!("Transfer failed for player {}: {:?}", player, e);
+            // Mark refund as failed atomically
+            game_session.mark_refund_failed()?;
+            return Err(e.into());
+        }
         
         // Track successful refund
         total_refunded = safe_add_u64(total_refunded, refund_amount)?;
@@ -173,6 +202,9 @@ pub fn refund_wager_handler<'info>(
         successful_refunds == active_players.len(),
         WagerError::IncompleteDistribution
     );
+
+    // CRITICAL FIX: Mark refund as completed atomically
+    game_session.mark_refund_completed()?;
     
     msg!("Refund completed successfully: {} tokens refunded to {} players", 
          total_refunded, successful_refunds);
@@ -186,7 +218,7 @@ pub struct RefundWager<'info> {
     /// The game server authority that created the session
     pub game_server: Signer<'info>,
 
-    // UPDATED: Enhanced PDA with authority in seeds
+    // ENHANCED: PDA with authority in seeds
     #[account(
         mut,
         seeds = [

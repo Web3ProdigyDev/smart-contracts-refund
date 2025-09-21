@@ -1,4 +1,4 @@
-// join_user.rs - COMPILATION FIXED VERSION
+// join_user.rs - RACE CONDITION FIXED WITH ATOMIC OPERATIONS
 use crate::{errors::WagerError, state::*, TOKEN_ID, utils::validate_session_id};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -10,7 +10,7 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
     // CRITICAL FIX: Enhanced validation
     validate_session_id(&session_id)?;
 
-    // Validate game status
+    // CRITICAL FIX: Atomic validation - only allow joining from WaitingForPlayers
     require!(
         game_session.status == GameStatus::WaitingForPlayers,
         WagerError::InvalidGameState
@@ -19,7 +19,7 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
     // Validate team number (0 for team A, 1 for team B)
     require!(team == 0 || team == 1, WagerError::InvalidTeamSelection);
 
-    // CRITICAL FIX: Check for duplicate players across both teams
+    // CRITICAL FIX: Check for duplicate players across both teams BEFORE any operations
     let player_key = ctx.accounts.user.key();
     require!(
         !game_session.is_player_already_joined(player_key)?,
@@ -55,8 +55,27 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
         WagerError::InvalidTokenMint
     );
 
+    // CRITICAL FIX: Start atomic operation - set operation lock
+    let clock = Clock::get()?;
+    let current_time = clock.unix_timestamp;
+    
+    // Check if any operation is currently in progress
+    if let Some(ref current_op) = game_session.current_operation {
+        // Check if operation has timed out (2 minutes for join operations)
+        if current_time - game_session.operation_started_at > 120 {
+            msg!("Join operation {} timed out, clearing lock", current_op);
+            game_session.current_operation = None;
+        } else {
+            return Err(error!(WagerError::ConcurrentOperation));
+        }
+    }
+    
+    // Set operation lock
+    game_session.current_operation = Some(format!("join_user_{}", player_key.to_string()[0..8].to_string()));
+    game_session.operation_started_at = current_time;
+
     // Transfer SPL tokens from user to vault using user's signature
-    anchor_spl::token::transfer(
+    let transfer_result = anchor_spl::token::transfer(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token::Transfer {
@@ -66,7 +85,14 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
             },
         ),
         session_bet,
-    )?;
+    );
+
+    // Handle transfer failure - clear operation lock
+    if let Err(e) = transfer_result {
+        game_session.current_operation = None;
+        game_session.operation_started_at = 0;
+        return Err(e.into());
+    }
 
     // Get reference to the selected team
     let selected_team = if team == 0 {
@@ -75,7 +101,13 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
         &mut game_session.team_b
     };
 
-    // Add player to the first available slot
+    // CRITICAL FIX: Double-check empty slot is still available (race condition protection)
+    require!(
+        selected_team.players[empty_index] == Pubkey::default(),
+        WagerError::ConcurrentOperation
+    );
+
+    // Add player to the first available slot atomically
     selected_team.players[empty_index] = player_key;
     selected_team.player_spawns[empty_index] = 10;
     selected_team.player_kills[empty_index] = 0;
@@ -85,9 +117,35 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
         .checked_add(session_bet)
         .ok_or(WagerError::ArithmeticError)?;
 
+    // CRITICAL FIX: Additional validation - ensure total bet doesn't exceed safe limits
+    const MAX_TEAM_BET: u64 = MAX_BET * 5; // Max 5 players per team
+    require!(
+        selected_team.total_bet <= MAX_TEAM_BET,
+        WagerError::ArithmeticError
+    );
+
+    // Update operation tracking
+    game_session.update_operation_tracking()?;
+
     // Check if both teams are full and update status atomically
     if game_session.check_all_filled()? {
-        game_session.status = GameStatus::InProgress;
+        // CRITICAL FIX: Use compare-and-swap to transition to InProgress
+        let success = game_session.compare_and_swap_status(
+            GameStatus::WaitingForPlayers,
+            GameStatus::InProgress,
+            Some("auto_start_game")
+        )?;
+        
+        if success {
+            msg!("Game automatically started - both teams full");
+        } else {
+            // Another thread might have started the game - that's okay
+            msg!("Game start handled by another operation");
+        }
+    } else {
+        // Clear operation lock since we're done with player addition
+        game_session.current_operation = None;
+        game_session.operation_started_at = 0;
     }
 
     msg!("Player {} joined team {} at position {} with bet {}", 

@@ -1,4 +1,4 @@
-// pay_to_spawn.rs - ATOMIC OPERATIONS WITH COMPREHENSIVE SAFETY CHECKS
+// pay_to_spawn.rs - RACE CONDITION FIXED WITH ATOMIC OPERATIONS AND BETTER BOUNDS CHECKING
 use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_bet_amount, validate_spawn_count}};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -36,16 +36,42 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
         WagerError::PlayerIndexOutOfBounds
     );
     
+    // CRITICAL FIX: Atomic operation lock to prevent concurrent spawn purchases
+    let clock = Clock::get()?;
+    let current_time = clock.unix_timestamp;
+    
+    // Check if any operation is currently in progress for this session
+    if let Some(ref current_op) = game_session.current_operation {
+        // Check if operation has timed out (30 seconds for spawn operations)
+        if current_time - game_session.operation_started_at > 30 {
+            msg!("Spawn operation {} timed out, clearing lock", current_op);
+            game_session.current_operation = None;
+        } else {
+            return Err(error!(WagerError::ConcurrentOperation));
+        }
+    }
+    
+    // Set operation lock for this spawn purchase
+    let operation_id = format!("spawn_{}_{}", team, player_key.to_string()[0..8].to_string());
+    game_session.current_operation = Some(operation_id.clone());
+    game_session.operation_started_at = current_time;
+    
     // ATOMIC OPERATION: Get current spawn count and validate increment atomically
     let current_spawns = match team {
         0 => game_session.team_a.player_spawns[player_index],
         1 => game_session.team_b.player_spawns[player_index],
-        _ => return Err(error!(WagerError::InvalidTeam)),
+        _ => {
+            game_session.current_operation = None; // Clear lock on error
+            return Err(error!(WagerError::InvalidTeam));
+        }
     };
     
     // CRITICAL FIX: Use utility function for comprehensive spawn validation
     const SPAWN_INCREMENT: u8 = 10;
-    validate_spawn_count(current_spawns, SPAWN_INCREMENT)?;
+    if let Err(e) = validate_spawn_count(current_spawns, SPAWN_INCREMENT) {
+        game_session.current_operation = None; // Clear lock on error
+        return Err(e);
+    }
 
     let session_bet = game_session.session_bet;
     validate_bet_amount(session_bet)?; // Additional validation
@@ -86,14 +112,21 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
     // This ensures state consistency even if token transfer fails
     let original_spawns = current_spawns;
     
-    // Use the safe spawn addition method which includes all validations
-    game_session.add_spawns_safe(team, player_index)?;
+    // Perform the spawn addition atomically
+    let add_result = game_session.add_spawns_safe(team, player_index);
+    if let Err(e) = add_result {
+        game_session.current_operation = None; // Clear lock on error
+        return Err(e);
+    }
     
     // Verify spawn addition was successful (atomic verification)
     let new_spawns = match team {
         0 => game_session.team_a.player_spawns[player_index],
         1 => game_session.team_b.player_spawns[player_index],
-        _ => return Err(error!(WagerError::InvalidTeam)),
+        _ => {
+            game_session.current_operation = None;
+            return Err(error!(WagerError::InvalidTeam));
+        }
     };
     
     require!(
@@ -129,6 +162,9 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
             1 => game_session.team_b.player_spawns[player_index] = original_spawns,
             _ => {},
         }
+        // Clear operation lock
+        game_session.current_operation = None;
+        game_session.operation_started_at = 0;
         return Err(e.into());
     }
     
@@ -154,20 +190,39 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
         WagerError::TokenTransferFailed
     );
 
-    // ENHANCED: Update team total bet tracking with overflow protection
+    // ENHANCED: Update team total bet tracking with overflow protection AND bounds checking
+    let current_team_bet = match team {
+        0 => game_session.team_a.total_bet,
+        1 => game_session.team_b.total_bet,
+        _ => {
+            game_session.current_operation = None;
+            return Err(error!(WagerError::InvalidTeam));
+        }
+    };
+
+    // CRITICAL FIX: Add explicit bounds checking for team total bet
+    const MAX_TEAM_TOTAL_BET: u64 = MAX_BET * 100; // Conservative limit: 100x max individual bet
+    let new_team_bet = current_team_bet
+        .checked_add(session_bet)
+        .ok_or(WagerError::ArithmeticError)?;
+    
+    require!(
+        new_team_bet <= MAX_TEAM_TOTAL_BET,
+        WagerError::ArithmeticError
+    );
+
     match team {
-        0 => {
-            game_session.team_a.total_bet = game_session.team_a.total_bet
-                .checked_add(session_bet)
-                .ok_or(WagerError::ArithmeticError)?;
-        },
-        1 => {
-            game_session.team_b.total_bet = game_session.team_b.total_bet
-                .checked_add(session_bet)
-                .ok_or(WagerError::ArithmeticError)?;
-        },
-        _ => return Err(error!(WagerError::InvalidTeam)),
+        0 => game_session.team_a.total_bet = new_team_bet,
+        1 => game_session.team_b.total_bet = new_team_bet,
+        _ => {
+            game_session.current_operation = None;
+            return Err(error!(WagerError::InvalidTeam));
+        }
     }
+
+    // CRITICAL FIX: Clear operation lock after successful completion
+    game_session.current_operation = None;
+    game_session.operation_started_at = 0;
 
     // Final comprehensive logging
     msg!("Spawn purchase completed successfully:");
@@ -178,6 +233,7 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
     msg!("  Cost: {}", session_bet);
     msg!("  Vault balance: {} -> {}", vault_balance_before, vault_balance_after);
     msg!("  User balance: {} -> {}", user_balance_before, user_balance_after);
+    msg!("  Team total bet: {} -> {}", current_team_bet, new_team_bet);
     msg!("  Session nonce: {}", game_session.nonce);
 
     Ok(())

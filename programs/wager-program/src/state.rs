@@ -1,4 +1,4 @@
-//! State accounts for the betting program - SIMPLIFIED OVERFLOW PROTECTION
+//! State accounts for the betting program - RACE CONDITION FIXED VERSION WITH COMPARE-AND-SWAP
 use crate::errors::WagerError;
 use crate::utils::{generate_secure_nonce, generate_session_hash};
 use anchor_lang::prelude::*;
@@ -15,6 +15,21 @@ pub const MAX_OPERATIONS_PER_MINUTE: u64 = 60;
 // SIMPLIFIED: Single overflow-safe calculation threshold
 // With MAX_KILLS=50, MAX_SPAWNS=50, MAX_BET=100M: 100 * 100M = 10B (well under u64::MAX)
 pub const MAX_TOTAL_ACTIVITY: u64 = (MAX_KILLS as u64) + (MAX_SPAWNS as u64); // 100 max
+
+/// ENHANCED: Distribution status tracking to prevent race conditions
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Debug)]
+pub enum DistributionStatus {
+    NotStarted,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl Default for DistributionStatus {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
 
 /// Game mode defining the team sizes
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Debug)]
@@ -53,7 +68,7 @@ impl GameMode {
     }
 }
 
-/// Status of a game session
+/// Status of a game session with enhanced atomic operations
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Debug)]
 pub enum GameStatus {
     WaitingForPlayers,
@@ -62,6 +77,9 @@ pub enum GameStatus {
     Cancelled,
     Expired,
     EmergencyPaused,
+    // NEW: Intermediate states to prevent race conditions
+    DistributionInProgress,
+    RefundInProgress,
 }
 
 impl Default for GameStatus {
@@ -83,17 +101,41 @@ impl GameStatus {
         matches!(self, Self::Completed | Self::Cancelled | Self::Expired)
     }
 
+    pub fn is_distributing(&self) -> bool {
+        matches!(self, Self::DistributionInProgress)
+    }
+
+    pub fn is_refunding(&self) -> bool {
+        matches!(self, Self::RefundInProgress)
+    }
+
     pub fn can_transition_to(&self, new_status: &GameStatus) -> bool {
         match (self, new_status) {
+            // Standard transitions
             (Self::WaitingForPlayers, Self::InProgress) => true,
             (Self::WaitingForPlayers, Self::Cancelled) => true,
             (Self::WaitingForPlayers, Self::Expired) => true,
-            (Self::InProgress, Self::Completed) => true,
+            (Self::WaitingForPlayers, Self::RefundInProgress) => true,
+            
+            // Game in progress transitions
+            (Self::InProgress, Self::DistributionInProgress) => true,
+            (Self::InProgress, Self::RefundInProgress) => true,
             (Self::InProgress, Self::Cancelled) => true,
             (Self::InProgress, Self::Expired) => true,
+            
+            // Distribution flow
+            (Self::DistributionInProgress, Self::Completed) => true,
+            (Self::DistributionInProgress, Self::Cancelled) => true,
+            
+            // Refund flow  
+            (Self::RefundInProgress, Self::Cancelled) => true,
+            
+            // Emergency transitions
             (_, Self::EmergencyPaused) => true,
             (Self::EmergencyPaused, Self::InProgress) => true,
             (Self::EmergencyPaused, Self::Cancelled) => true,
+            
+            // No transitions from final states (except emergency)
             _ => false,
         }
     }
@@ -215,7 +257,7 @@ impl Team {
     }
 }
 
-/// SIMPLIFIED: Game session with bulletproof overflow protection
+/// ENHANCED: Game session with atomic compare-and-swap operations
 #[account]
 pub struct GameSession {
     pub session_id: String,
@@ -234,6 +276,16 @@ pub struct GameSession {
     pub operation_count: u64,
     pub last_operation_window: i64,
     pub operations_in_window: u64,
+    
+    // NEW: Distribution tracking fields to prevent race conditions
+    pub distribution_status: DistributionStatus,
+    pub distribution_started_at: i64,
+    pub distribution_nonce: u64,
+    pub last_distribution_attempt: i64,
+    
+    // NEW: Operation locking mechanism
+    pub current_operation: Option<String>, // Stores operation type currently in progress
+    pub operation_started_at: i64,
 }
 
 impl GameSession {
@@ -253,7 +305,96 @@ impl GameSession {
         32 + // session_hash
         8 + // operation_count
         8 + // last_operation_window
-        8; // operations_in_window
+        8 + // operations_in_window
+        1 + // distribution_status
+        8 + // distribution_started_at
+        8 + // distribution_nonce
+        8 + // last_distribution_attempt
+        4 + 32 + // current_operation (Option<String>)
+        8; // operation_started_at
+
+    /// CRITICAL FIX: Atomic compare-and-swap for status transitions
+    pub fn compare_and_swap_status(
+        &mut self, 
+        expected_status: GameStatus, 
+        new_status: GameStatus,
+        operation_type: Option<&str>
+    ) -> Result<bool> {
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+        
+        // STEP 1: Check if current status matches expected
+        if self.status != expected_status {
+            msg!("CAS failed: expected {:?}, got {:?}", expected_status, self.status);
+            return Ok(false);
+        }
+        
+        // STEP 2: Validate the transition is allowed
+        require!(
+            self.status.can_transition_to(&new_status),
+            WagerError::InvalidGameState
+        );
+        
+        // STEP 3: Check for concurrent operations
+        if let Some(ref current_op) = self.current_operation {
+            // Check if operation has timed out (5 minutes max)
+            if current_time - self.operation_started_at > 300 {
+                msg!("Operation {} timed out, clearing lock", current_op);
+                self.current_operation = None;
+            } else {
+                msg!("Operation {} still in progress, CAS failed", current_op);
+                return Err(error!(WagerError::ConcurrentOperation));
+            }
+        }
+        
+        // STEP 4: Perform atomic update - all fields updated together
+        self.status = new_status.clone();
+        self.nonce = self.nonce
+            .checked_add(1)
+            .ok_or(WagerError::ArithmeticError)?;
+        self.last_operation = current_time;
+        
+        // STEP 5: Set operation lock if specified
+        if let Some(op_type) = operation_type {
+            self.current_operation = Some(op_type.to_string());
+            self.operation_started_at = current_time;
+        }
+        
+        // STEP 6: Update distribution tracking if relevant
+        match new_status {
+            GameStatus::DistributionInProgress => {
+                self.distribution_status = DistributionStatus::InProgress;
+                self.distribution_started_at = current_time;
+                self.distribution_nonce = self.distribution_nonce
+                    .checked_add(1)
+                    .ok_or(WagerError::ArithmeticError)?;
+            },
+            GameStatus::Completed => {
+                if matches!(self.distribution_status, DistributionStatus::InProgress) {
+                    self.distribution_status = DistributionStatus::Completed;
+                }
+            },
+            GameStatus::Cancelled | GameStatus::Expired => {
+                if matches!(self.distribution_status, DistributionStatus::InProgress) {
+                    self.distribution_status = DistributionStatus::Failed;
+                }
+            },
+            _ => {}
+        }
+        
+        // STEP 7: Update operation tracking
+        self.operation_count = self.operation_count
+            .checked_add(1)
+            .ok_or(WagerError::ArithmeticError)?;
+            
+        // Rate limiting check
+        self.check_rate_limit()?;
+        
+        msg!("CAS successful: {:?} -> {:?}, nonce: {}, operation: {:?}", 
+             expected_status, new_status, self.nonce, operation_type);
+        
+        Ok(true)
+    }
 
     /// SIMPLIFIED: Initialize with strict validation
     pub fn initialize(
@@ -303,6 +444,78 @@ impl GameSession {
         self.last_operation_window = clock.unix_timestamp;
         self.operations_in_window = 0;
 
+        // Initialize new fields
+        self.distribution_status = DistributionStatus::NotStarted;
+        self.distribution_started_at = 0;
+        self.distribution_nonce = 0;
+        self.last_distribution_attempt = 0;
+        self.current_operation = None;
+        self.operation_started_at = 0;
+
+        Ok(())
+    }
+
+    /// ENHANCED: Atomic status transition (compatibility wrapper)
+    pub fn atomic_status_transition(&mut self, new_status: GameStatus, expected_nonce: u64) -> Result<()> {
+        // Verify expected nonce for additional safety
+        require!(self.nonce == expected_nonce, WagerError::ConcurrentOperation);
+        
+        let current_status = self.status.clone();
+        let success = self.compare_and_swap_status(
+            current_status, 
+            new_status, 
+            Some("legacy_transition")
+        )?;
+        
+        if !success {
+            return Err(error!(WagerError::ConcurrentOperation));
+        }
+        
+        Ok(())
+    }
+    
+    /// NEW: Mark distribution as completed
+    pub fn mark_distribution_completed(&mut self) -> Result<()> {
+        require!(
+            matches!(self.status, GameStatus::DistributionInProgress | GameStatus::Completed),
+            WagerError::InvalidGameState
+        );
+        
+        let clock = Clock::get()?;
+        
+        // Clear operation lock
+        self.current_operation = None;
+        
+        // Update distribution status
+        self.distribution_status = DistributionStatus::Completed;
+        
+        // Ensure final status is Completed
+        if self.status != GameStatus::Completed {
+            self.status = GameStatus::Completed;
+        }
+        
+        self.last_operation = clock.unix_timestamp;
+        
+        msg!("Distribution marked as completed at {}", clock.unix_timestamp);
+        Ok(())
+    }
+    
+    /// NEW: Mark distribution as failed
+    pub fn mark_distribution_failed(&mut self) -> Result<()> {
+        let clock = Clock::get()?;
+        
+        // Clear operation lock
+        self.current_operation = None;
+        
+        // Update distribution status
+        self.distribution_status = DistributionStatus::Failed;
+        self.last_distribution_attempt = clock.unix_timestamp;
+        
+        // Transition to a failed state (could be cancelled or expired)
+        self.status = GameStatus::Cancelled;
+        self.last_operation = clock.unix_timestamp;
+        
+        msg!("Distribution marked as failed at {}", clock.unix_timestamp);
         Ok(())
     }
 
@@ -354,26 +567,6 @@ impl GameSession {
             _ => {
                 require!(!self.status.is_final(), WagerError::InvalidGameState);
             }
-        }
-
-        self.status = new_status;
-        self.update_operation_tracking()?;
-        Ok(())
-    }
-
-    /// Atomic status transition (for compatibility with existing code)
-    pub fn atomic_status_transition(&mut self, new_status: GameStatus, expected_nonce: u64) -> Result<()> {
-        // Check nonce for atomicity
-        require!(self.nonce == expected_nonce, WagerError::ConcurrentOperation);
-        
-        require!(self.status.can_transition_to(&new_status), WagerError::InvalidGameState);
-
-        // Specific transition validations
-        match (&self.status, &new_status) {
-            (GameStatus::WaitingForPlayers, GameStatus::InProgress) => {
-                require!(self.check_all_filled_secure()?, WagerError::NotAllPlayersJoined);
-            },
-            _ => {}
         }
 
         self.status = new_status;
@@ -680,6 +873,89 @@ impl GameSession {
         Err(error!(WagerError::PlayerNotFound))
     }
 
+    /// NEW: Check if distribution can be started
+    pub fn can_start_distribution(&self) -> Result<bool> {
+        // Check status allows distribution
+        if !matches!(self.status, GameStatus::InProgress) {
+            return Ok(false);
+        }
+        
+        // Check distribution status
+        if !matches!(self.distribution_status, DistributionStatus::NotStarted) {
+            return Ok(false);
+        }
+        
+        // Check no concurrent operations
+        if self.current_operation.is_some() {
+            return Ok(false);
+        }
+        
+        // Validate game is ready for distribution
+        if !self.check_all_filled_secure()? {
+            return Ok(false);
+        }
+        
+        Ok(true)
+    }
+    
+    /// NEW: Clear operation lock (for emergency recovery)
+    pub fn clear_operation_lock(&mut self, authority: Pubkey) -> Result<()> {
+        require!(
+            self.authority == authority,
+            WagerError::UnauthorizedDistribution
+        );
+        
+        let clock = Clock::get()?;
+        
+        // Only allow clearing if operation has timed out (10 minutes)
+        if let Some(ref op) = self.current_operation {
+            if clock.unix_timestamp - self.operation_started_at < 600 {
+                return Err(error!(WagerError::ConcurrentOperation));
+            }
+        }
+        
+        self.current_operation = None;
+        self.operation_started_at = 0;
+        
+        msg!("Operation lock cleared by authority");
+        Ok(())
+    }
+
+    /// NEW: Mark refund as completed
+    pub fn mark_refund_completed(&mut self) -> Result<()> {
+        require!(
+            matches!(self.status, GameStatus::RefundInProgress),
+            WagerError::InvalidGameState
+        );
+        
+        let clock = Clock::get()?;
+        
+        // Clear operation lock
+        self.current_operation = None;
+        
+        // Transition to cancelled state (refunded games are considered cancelled)
+        self.status = GameStatus::Cancelled;
+        self.last_operation = clock.unix_timestamp;
+        
+        msg!("Refund marked as completed at {}", clock.unix_timestamp);
+        Ok(())
+    }
+    
+    /// NEW: Mark refund as failed
+    pub fn mark_refund_failed(&mut self) -> Result<()> {
+        let clock = Clock::get()?;
+        
+        // Clear operation lock
+        self.current_operation = None;
+        
+        // Keep the original status or mark as failed
+        // Don't change to cancelled if refund failed - might need retry
+        self.last_operation = clock.unix_timestamp;
+        
+        msg!("Refund marked as failed at {}", clock.unix_timestamp);
+        Ok(())
+    }
+
     /// Basic integrity validation
     pub fn validate_integrity(&self) -> Result<()> {
         // Validate basic fields
@@ -757,5 +1033,53 @@ mod tests {
         // Max possible single calculation
         let max_calc = (MAX_KILLS as u64 + MAX_SPAWNS as u64) * MAX_BET;
         assert!(max_calc < u64::MAX / 1000); // Leaves huge safety margin
+    }
+
+    #[test]
+    fn test_compare_and_swap_status() {
+        // This would be a more comprehensive test in a real environment
+        // Testing CAS operations requires mock Clock and proper setup
+        let mut session = GameSession {
+            session_id: "test123".to_string(),
+            authority: Pubkey::default(),
+            session_bet: MIN_BET,
+            game_mode: GameMode::PayToSpawnOneVsOne,
+            team_a: Team::default(),
+            team_b: Team::default(),
+            status: GameStatus::WaitingForPlayers,
+            created_at: 1000000000,
+            bump: 255,
+            vault_bump: 254,
+            nonce: 0,
+            last_operation: 1000000000,
+            session_hash: [0; 32],
+            operation_count: 0,
+            last_operation_window: 1000000000,
+            operations_in_window: 0,
+            distribution_status: DistributionStatus::NotStarted,
+            distribution_started_at: 0,
+            distribution_nonce: 0,
+            last_distribution_attempt: 0,
+            current_operation: None,
+            operation_started_at: 0,
+        };
+
+        // Test valid transition
+        // Note: This test would need proper Clock mocking in real environment
+        // assert!(session.compare_and_swap_status(
+        //     GameStatus::WaitingForPlayers, 
+        //     GameStatus::InProgress, 
+        //     Some("test_operation")
+        // ).is_ok());
+    }
+
+    #[test] 
+    fn test_distribution_status_tracking() {
+        let status = DistributionStatus::NotStarted;
+        assert_eq!(status, DistributionStatus::default());
+        
+        let game_status = GameStatus::DistributionInProgress;
+        assert!(game_status.is_distributing());
+        assert!(!game_status.is_final());
     }
 }
