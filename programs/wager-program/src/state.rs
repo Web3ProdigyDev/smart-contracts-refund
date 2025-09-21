@@ -1,38 +1,42 @@
-//! State accounts for the betting program - SECURITY HARDENED WITH ATOMIC OPERATIONS
+//! State accounts for the betting program - SECURITY HARDENED WITH PROPER ATOMIC OPERATIONS
 use crate::errors::WagerError;
-use crate::utils::{validate_kill_count, validate_spawn_count, generate_secure_nonce};
+use crate::utils::{validate_kill_count, validate_spawn_count, generate_secure_nonce, generate_session_hash};
 use anchor_lang::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
+
+/// Maximum safe values to prevent overflow in earnings calculations
+pub const MAX_SAFE_KILLS: u8 = 100;
+pub const MAX_SAFE_SPAWNS: u8 = 100;
+pub const MAX_SAFE_BET: u64 = 1_000_000_000; // 1 billion lamports (~1 SOL)
+pub const MIN_SAFE_BET: u64 = 1_000_000; // 0.001 SOL minimum
+pub const GAME_TIMEOUT_SECONDS: i64 = 24 * 60 * 60; // 24 hours
+pub const MAX_OPERATIONS_PER_MINUTE: u64 = 60; // Rate limiting
 
 /// Game mode defining the team sizes
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Debug)]
 pub enum GameMode {
-    WinnerTakesAllOneVsOne,     // 1v1 game mode
-    WinnerTakesAllThreeVsThree, // 3v3 game mode
-    WinnerTakesAllFiveVsFive,   // 5v5 game mode
-    PayToSpawnOneVsOne,         // 1v1 game mode
-    PayToSpawnThreeVsThree,     // 3v3 game mode
-    PayToSpawnFiveVsFive,       // 5v5 game mode
+    WinnerTakesAllOneVsOne,
+    WinnerTakesAllThreeVsThree,
+    WinnerTakesAllFiveVsFive,
+    PayToSpawnOneVsOne,
+    PayToSpawnThreeVsThree,
+    PayToSpawnFiveVsFive,
 }
 
 impl GameMode {
-    /// Returns the required number of players per team
     pub fn players_per_team(&self) -> usize {
         match self {
-            Self::WinnerTakesAllOneVsOne => 1,
-            Self::WinnerTakesAllThreeVsThree => 3,
-            Self::WinnerTakesAllFiveVsFive => 5,
-            Self::PayToSpawnOneVsOne => 1,
-            Self::PayToSpawnThreeVsThree => 3,
-            Self::PayToSpawnFiveVsFive => 5,
+            Self::WinnerTakesAllOneVsOne | Self::PayToSpawnOneVsOne => 1,
+            Self::WinnerTakesAllThreeVsThree | Self::PayToSpawnThreeVsThree => 3,
+            Self::WinnerTakesAllFiveVsFive | Self::PayToSpawnFiveVsFive => 5,
         }
     }
 
-    /// ENHANCED: Get maximum allowed players to prevent array bounds issues
     pub fn max_players_per_team(&self) -> usize {
-        5 // Always 5 since we use fixed arrays
+        5 // Fixed array size
     }
 
-    /// ENHANCED: Validate team size is within bounds
     pub fn validate_team_size(&self, team_size: usize) -> Result<()> {
         require!(
             team_size == self.players_per_team(),
@@ -40,16 +44,37 @@ impl GameMode {
         );
         Ok(())
     }
+
+    /// Get spawn increment based on game mode for economic balance
+    pub fn spawn_increment(&self) -> u8 {
+        match self {
+            Self::PayToSpawnOneVsOne => 5,        // Lower increment for 1v1
+            Self::PayToSpawnThreeVsThree => 8,    // Medium increment for 3v3
+            Self::PayToSpawnFiveVsFive => 10,     // Higher increment for 5v5
+            _ => 10, // Default for non-pay-to-spawn modes
+        }
+    }
+
+    /// Check if mode supports pay-to-spawn
+    pub fn is_pay_to_spawn(&self) -> bool {
+        matches!(
+            self,
+            Self::PayToSpawnOneVsOne
+                | Self::PayToSpawnThreeVsThree
+                | Self::PayToSpawnFiveVsFive
+        )
+    }
 }
 
-/// Status of a game session - ENHANCED with more specific states
+/// Status of a game session
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Debug)]
 pub enum GameStatus {
-    WaitingForPlayers, // Waiting for players to join
-    InProgress,        // Game is active with all players joined
-    Completed,         // Game has finished and rewards distributed
-    Cancelled,         // Game was cancelled and refunds processed
-    Expired,          // Game expired without completion
+    WaitingForPlayers,
+    InProgress,
+    Completed,
+    Cancelled,
+    Expired,
+    EmergencyPaused, // New status for emergency situations
 }
 
 impl Default for GameStatus {
@@ -59,42 +84,41 @@ impl Default for GameStatus {
 }
 
 impl GameStatus {
-    /// ENHANCED: Check if status allows new players to join
     pub fn allows_joining(&self) -> bool {
         matches!(self, Self::WaitingForPlayers)
     }
 
-    /// ENHANCED: Check if status allows game operations (kills, spawns)
     pub fn allows_game_operations(&self) -> bool {
         matches!(self, Self::InProgress)
     }
 
-    /// ENHANCED: Check if status is final (no more operations allowed)
     pub fn is_final(&self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled | Self::Expired)
     }
 
-    /// ENHANCED: Validate status transition is allowed
     pub fn can_transition_to(&self, new_status: &GameStatus) -> bool {
         match (self, new_status) {
             (Self::WaitingForPlayers, Self::InProgress) => true,
             (Self::WaitingForPlayers, Self::Cancelled) => true,
+            (Self::WaitingForPlayers, Self::Expired) => true,
             (Self::InProgress, Self::Completed) => true,
             (Self::InProgress, Self::Cancelled) => true,
-            (Self::WaitingForPlayers, Self::Expired) => true,
             (Self::InProgress, Self::Expired) => true,
+            (_, Self::EmergencyPaused) => true, // Can pause from any state
+            (Self::EmergencyPaused, Self::InProgress) => true, // Can resume
+            (Self::EmergencyPaused, Self::Cancelled) => true, // Can cancel from pause
             _ => false,
         }
     }
 }
 
-/// Represents a team in the game - COMPILATION FIXED
+/// Represents a team in the game - FIXED OVERFLOW PROTECTION
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct Team {
-    pub players: [Pubkey; 5],    // Array of player public keys
-    pub total_bet: u64,          // Total amount bet by team (in lamports)  
-    pub player_spawns: [u8; 5],  // u8 instead of u16 (255 max spawns)
-    pub player_kills: [u8; 5],   // u8 instead of u16 (255 max kills)
+    pub players: [Pubkey; 5],
+    pub total_bet: u64,
+    pub player_spawns: [u8; 5],
+    pub player_kills: [u8; 5],
 }
 
 impl Default for Team {
@@ -102,14 +126,14 @@ impl Default for Team {
         Self {
             players: [Pubkey::default(); 5],
             total_bet: 0,
-            player_spawns: [10; 5], // Start with 10 spawns instead of 0
+            player_spawns: [10; 5], // Start with 10 spawns
             player_kills: [0; 5],
         }
     }
 }
 
 impl Team {
-    /// ENHANCED: Finds the first empty slot in the team with bounds checking
+    /// FIXED: Finds the first empty slot in the team with proper bounds checking
     pub fn get_empty_slot(&self, player_count: usize) -> Result<usize> {
         require!(
             player_count <= 5,
@@ -119,23 +143,23 @@ impl Team {
         self.players
             .iter()
             .enumerate()
-            .take(player_count) // Only check slots we actually use
+            .take(player_count)
             .find(|(_, player)| **player == Pubkey::default())
             .map(|(i, _)| i)
             .ok_or_else(|| error!(WagerError::TeamIsFull))
     }
     
-    /// FIXED: Check if a player is already in this team with proper bool return
-    pub fn contains_player(&self, player: Pubkey, player_count: usize) -> bool {
-        // COMPILATION FIX: Simple validation without require! macro
-        if player_count > 5 || player == Pubkey::default() {
-            return false;
-        }
+    /// FIXED: Proper player validation with explicit error handling
+    pub fn contains_player(&self, player: Pubkey, player_count: usize) -> Result<bool> {
+        require!(player_count <= 5, WagerError::PlayerIndexOutOfBounds);
+        require!(player != Pubkey::default(), WagerError::InvalidPlayer);
         
-        self.players[0..player_count].iter().any(|&p| p == player)
+        Ok(self.players[0..player_count]
+            .iter()
+            .any(|&p| p == player && p != Pubkey::default()))
     }
 
-    /// ENHANCED: Validate team composition
+    /// ENHANCED: Validate team composition with duplicate detection
     pub fn validate_composition(&self, expected_count: usize) -> Result<()> {
         require!(
             expected_count <= 5,
@@ -153,7 +177,7 @@ impl Team {
         );
 
         // Validate no duplicates within team
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for &player in &self.players[0..expected_count] {
             if player != Pubkey::default() {
                 require!(
@@ -173,7 +197,20 @@ impl Team {
             WagerError::PlayerIndexOutOfBounds
         );
 
-        Ok((self.player_kills[player_index], self.player_spawns[player_index]))
+        let kills = self.player_kills[player_index];
+        let spawns = self.player_spawns[player_index];
+
+        require!(
+            kills <= MAX_SAFE_KILLS,
+            WagerError::InvalidKillCount
+        );
+        
+        require!(
+            spawns <= MAX_SAFE_SPAWNS,
+            WagerError::SpawnLimitExceeded
+        );
+
+        Ok((kills, spawns))
     }
 
     /// ENHANCED: Set player stats with validation
@@ -183,43 +220,84 @@ impl Team {
             WagerError::PlayerIndexOutOfBounds
         );
 
+        require!(
+            kills <= MAX_SAFE_KILLS,
+            WagerError::InvalidKillCount
+        );
+        
+        require!(
+            spawns <= MAX_SAFE_SPAWNS,
+            WagerError::SpawnLimitExceeded
+        );
+
         validate_kill_count(kills)?;
-        // Don't validate spawn count here as it might be called during updates
 
         self.player_kills[player_index] = kills;
         self.player_spawns[player_index] = spawns;
 
         Ok(())
     }
+
+    /// FIXED: Safe calculation of total activity
+    pub fn calculate_safe_total_activity(&self, player_count: usize) -> Result<u64> {
+        let mut total: u64 = 0;
+        
+        for i in 0..player_count.min(5) {
+            let kills = self.player_kills[i] as u64;
+            let spawns = self.player_spawns[i] as u64;
+            
+            require!(
+                kills <= MAX_SAFE_KILLS as u64,
+                WagerError::ValueTooLarge
+            );
+            
+            require!(
+                spawns <= MAX_SAFE_SPAWNS as u64,
+                WagerError::ValueTooLarge
+            );
+            
+            let player_activity = kills
+                .checked_add(spawns)
+                .ok_or(WagerError::ArithmeticError)?;
+                
+            total = total
+                .checked_add(player_activity)
+                .ok_or(WagerError::ArithmeticError)?;
+        }
+        
+        Ok(total)
+    }
 }
 
-/// Represents a game session - ENHANCED with atomic operations and security
+/// FIXED: Game session with proper atomic operations and security
 #[account]
 pub struct GameSession {
-    pub session_id: String,      // 4 + variable (max 32 bytes)
-    pub authority: Pubkey,       // 32 bytes
-    pub session_bet: u64,        // 8 bytes
-    pub game_mode: GameMode,     // 1 byte (enum)
-    pub team_a: Team,            // 32*5 + 8 + 5 + 5 = 178 bytes
-    pub team_b: Team,            // 32*5 + 8 + 5 + 5 = 178 bytes  
-    pub status: GameStatus,      // 1 byte (enum)
-    pub created_at: i64,         // 8 bytes
-    pub bump: u8,                // 1 byte
-    pub vault_bump: u8,          // 1 byte
-    pub nonce: u64,              // ENHANCED: 8 bytes - for preventing replay attacks
-    pub last_operation: i64,     // ENHANCED: 8 bytes - timestamp of last operation
-    pub session_hash: [u8; 32],  // NEW: 32 bytes - cryptographic session identifier
-    pub operation_count: u64,    // NEW: 8 bytes - total operations counter
+    pub session_id: String,
+    pub authority: Pubkey,
+    pub session_bet: u64,
+    pub game_mode: GameMode,
+    pub team_a: Team,
+    pub team_b: Team,
+    pub status: GameStatus,
+    pub created_at: i64,
+    pub bump: u8,
+    pub vault_bump: u8,
+    pub nonce: u64, // For atomic operations
+    pub last_operation: i64,
+    pub session_hash: [u8; 32],
+    pub operation_count: u64,
+    pub last_operation_window: i64, // For rate limiting
+    pub operations_in_window: u64,  // Operations counter for rate limiting
 }
 
 impl GameSession {
     pub const MAX_SIZE: usize = 8 + // discriminator
-        4 + 32 + // session_id (String)
+        4 + 32 + // session_id
         32 + // authority
         8 + // session_bet
         1 + // game_mode
         (32 * 5 + 8 + 5 + 5) + // team_a
-        (32 * 5 + 8 + 5 + 5) + // team_b  
+        (32 * 5 + 8 + 5 + 5) + // team_b
         1 + // status
         8 + // created_at
         1 + // bump
@@ -227,10 +305,11 @@ impl GameSession {
         8 + // nonce
         8 + // last_operation
         32 + // session_hash
-        8; // operation_count
-        // Total: ~514 bytes
+        8 + // operation_count
+        8 + // last_operation_window
+        8; // operations_in_window
 
-    /// ENHANCED: Initialize with proper validation and cryptographic security
+    /// FIXED: Initialize with proper validation
     pub fn initialize(
         &mut self,
         session_id: String,
@@ -240,10 +319,27 @@ impl GameSession {
         bump: u8,
         vault_bump: u8,
     ) -> Result<()> {
+        // Validate session ID
+        require!(
+            session_id.len() >= 12 && session_id.len() <= 32,
+            WagerError::InvalidSessionId
+        );
+        
+        require!(
+            session_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+            WagerError::InvalidSessionId
+        );
+
+        // Validate bet amount with proper bounds
+        require!(
+            session_bet >= MIN_SAFE_BET && session_bet <= MAX_SAFE_BET,
+            WagerError::InvalidBetAmount
+        );
+
         let clock = Clock::get()?;
         
         // Generate cryptographically secure session hash
-        let session_hash = crate::utils::generate_session_hash(
+        let session_hash = generate_session_hash(
             &session_id, 
             authority, 
             clock.unix_timestamp
@@ -263,25 +359,60 @@ impl GameSession {
         self.last_operation = clock.unix_timestamp;
         self.session_hash = session_hash;
         self.operation_count = 0;
+        self.last_operation_window = clock.unix_timestamp;
+        self.operations_in_window = 0;
 
         Ok(())
     }
 
-    /// CRITICAL SECURITY FIX: Atomic operation tracking with race condition prevention
+    /// FIXED: Rate limiting check
+    pub fn check_rate_limit(&mut self) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+        
+        // Reset window if more than 1 minute has passed
+        if current_time - self.last_operation_window >= 60 {
+            self.last_operation_window = current_time;
+            self.operations_in_window = 0;
+        }
+        
+        require!(
+            self.operations_in_window < MAX_OPERATIONS_PER_MINUTE,
+            WagerError::RateLimitExceeded
+        );
+        
+        self.operations_in_window += 1;
+        Ok(())
+    }
+
+    /// FIXED: Proper atomic operation tracking
     pub fn update_operation_tracking(&mut self) -> Result<()> {
         let clock = Clock::get()?;
         
+        // Check rate limit first
+        self.check_rate_limit()?;
+        
         // Atomic increment with overflow protection
-        self.nonce = self.nonce.checked_add(1).ok_or(WagerError::ArithmeticError)?;
-        self.operation_count = self.operation_count.checked_add(1).ok_or(WagerError::ArithmeticError)?;
+        self.nonce = self.nonce
+            .checked_add(1)
+            .ok_or(WagerError::ArithmeticError)?;
+        self.operation_count = self.operation_count
+            .checked_add(1)
+            .ok_or(WagerError::ArithmeticError)?;
         self.last_operation = clock.unix_timestamp;
         
         Ok(())
     }
 
-    /// CRITICAL SECURITY FIX: Atomic status transition with comprehensive validation
+    /// CRITICAL FIX: Proper atomic status transition
     pub fn atomic_status_transition(&mut self, new_status: GameStatus, expected_nonce: u64) -> Result<()> {
-        // ATOMIC CHECK: Verify current nonce matches expected (prevents race conditions)
+        // Check for emergency pause
+        if matches!(self.status, GameStatus::EmergencyPaused) && 
+           !matches!(new_status, GameStatus::InProgress | GameStatus::Cancelled) {
+            return Err(error!(WagerError::EmergencyPaused));
+        }
+
+        // Atomic nonce check - this must be the first check
         require!(
             self.nonce == expected_nonce,
             WagerError::ConcurrentOperation
@@ -302,35 +433,34 @@ impl GameSession {
                 );
             },
             (GameStatus::InProgress, GameStatus::Completed) => {
-                // Valid transition - no additional checks needed
+                // Valid transition
             },
             (_, GameStatus::Cancelled) => {
                 // Can cancel from most states
             },
             (_, GameStatus::Expired) => {
-                // Can expire from non-final states
                 require!(
                     !self.status.is_final(),
                     WagerError::InvalidGameState
                 );
             },
-            _ => return Err(error!(WagerError::InvalidGameState)),
+            _ => {}
         }
 
-        // ATOMIC UPDATE: Change status and increment nonce in single operation
+        // ATOMIC UPDATE: Status and nonce in single operation
         self.status = new_status;
         self.update_operation_tracking()?;
         
         Ok(())
     }
 
-    /// Legacy method that now uses atomic operations
+    /// Legacy wrapper for compatibility
     pub fn transition_status(&mut self, new_status: GameStatus) -> Result<()> {
         let current_nonce = self.nonce;
         self.atomic_status_transition(new_status, current_nonce)
     }
 
-    /// Gets an empty slot for a player in the specified team
+    /// Get empty slot for player
     pub fn get_player_empty_slot(&self, team: u8) -> Result<usize> {
         let player_count = self.game_mode.players_per_team();
         match team {
@@ -340,11 +470,11 @@ impl GameSession {
         }
     }
 
-    /// ENHANCED: Check all teams are filled with comprehensive validation
+    /// FIXED: Check all teams filled with cross-team duplicate validation
     pub fn check_all_filled_secure(&self) -> Result<bool> {
         let player_count = self.game_mode.players_per_team();
         
-        // Validate team compositions first
+        // Validate team compositions
         self.team_a.validate_composition(player_count)?;
         self.team_b.validate_composition(player_count)?;
 
@@ -364,27 +494,21 @@ impl GameSession {
         Ok(true)
     }
 
-    /// Legacy method for backward compatibility
+    /// Legacy method
     pub fn check_all_filled(&self) -> Result<bool> {
         self.check_all_filled_secure()
     }
 
-    /// ENHANCED: Check if game mode supports pay-to-spawn
+    /// Check if pay-to-spawn mode
     pub fn is_pay_to_spawn(&self) -> bool {
-        matches!(
-            self.game_mode,
-            GameMode::PayToSpawnOneVsOne
-                | GameMode::PayToSpawnThreeVsThree
-                | GameMode::PayToSpawnFiveVsFive
-        )
+        self.game_mode.is_pay_to_spawn()
     }
 
-    /// ENHANCED: Get all active players with validation
+    /// Get all active players
     pub fn get_all_players(&self) -> Vec<Pubkey> {
         let mut players = Vec::with_capacity(10);
         let player_count = self.game_mode.players_per_team();
         
-        // Only include actual players (not default pubkeys)
         for i in 0..player_count {
             let player_a = self.team_a.players[i];
             let player_b = self.team_b.players[i];
@@ -400,7 +524,7 @@ impl GameSession {
         players
     }
 
-    /// ENHANCED: Get player index with comprehensive validation
+    /// Get player index with validation
     pub fn get_player_index(&self, team: u8, player: Pubkey) -> Result<usize> {
         require!(team == 0 || team == 1, WagerError::InvalidTeam);
         require!(player != Pubkey::default(), WagerError::InvalidPlayer);
@@ -418,7 +542,7 @@ impl GameSession {
             .ok_or(error!(WagerError::PlayerNotFound))
     }
 
-    /// ENHANCED: Gets the kill and spawn sum for a player with validation
+    /// FIXED: Get kills and spawns with proper overflow protection
     pub fn get_kills_and_spawns(&self, player_pubkey: Pubkey) -> Result<u16> {
         require!(player_pubkey != Pubkey::default(), WagerError::InvalidPlayer);
         
@@ -429,9 +553,17 @@ impl GameSession {
             .iter()
             .position(|p| *p == player_pubkey) 
         {
-            let kills = self.team_a.player_kills[idx] as u16;
-            let spawns = self.team_a.player_spawns[idx] as u16;
-            return Ok(kills.checked_add(spawns).ok_or(WagerError::ArithmeticError)?);
+            let kills = self.team_a.player_kills[idx];
+            let spawns = self.team_a.player_spawns[idx];
+            
+            require!(
+                kills <= MAX_SAFE_KILLS && spawns <= MAX_SAFE_SPAWNS,
+                WagerError::InvalidKillCount
+            );
+            
+            return Ok((kills as u16)
+                .checked_add(spawns as u16)
+                .ok_or(WagerError::ArithmeticError)?);
         }
         
         // Check team B
@@ -439,15 +571,54 @@ impl GameSession {
             .iter()
             .position(|p| *p == player_pubkey) 
         {
-            let kills = self.team_b.player_kills[idx] as u16;
-            let spawns = self.team_b.player_spawns[idx] as u16;
-            return Ok(kills.checked_add(spawns).ok_or(WagerError::ArithmeticError)?);
+            let kills = self.team_b.player_kills[idx];
+            let spawns = self.team_b.player_spawns[idx];
+            
+            require!(
+                kills <= MAX_SAFE_KILLS && spawns <= MAX_SAFE_SPAWNS,
+                WagerError::InvalidKillCount
+            );
+            
+            return Ok((kills as u16)
+                .checked_add(spawns as u16)
+                .ok_or(WagerError::ArithmeticError)?);
         }
         
         Err(error!(WagerError::PlayerNotFound))
     }
 
-    /// ENHANCED: Add kill with comprehensive validation and atomic operations
+    /// CRITICAL FIX: Proper earnings calculation without overly restrictive validation
+    pub fn calculate_player_earnings_safe(&self, player_pubkey: Pubkey) -> Result<u64> {
+        require!(player_pubkey != Pubkey::default(), WagerError::InvalidPlayer);
+        
+        // Get kills and spawns safely
+        let kills_and_spawns_u16 = self.get_kills_and_spawns(player_pubkey)?;
+        let kills_and_spawns_u64 = kills_and_spawns_u16 as u64;
+        
+        // Validate session bet is within bounds
+        require!(
+            self.session_bet >= MIN_SAFE_BET && self.session_bet <= MAX_SAFE_BET,
+            WagerError::InvalidBetAmount
+        );
+        
+        // Realistic validation - maximum reasonable activity
+        const MAX_REASONABLE_ACTIVITY: u64 = (MAX_SAFE_KILLS as u64) + (MAX_SAFE_SPAWNS as u64);
+        require!(
+            kills_and_spawns_u64 <= MAX_REASONABLE_ACTIVITY,
+            WagerError::InvalidKillCount
+        );
+        
+        // This calculation will never overflow with our constants:
+        // Max: 200 * 1_000_000_000 = 200_000_000_000 (well within u64 range)
+        let earnings = kills_and_spawns_u64
+            .checked_mul(self.session_bet)
+            .and_then(|product| product.checked_div(10))
+            .ok_or(WagerError::ArithmeticError)?;
+        
+        Ok(earnings)
+    }
+
+    /// FIXED: Add kill with proper atomic operations and validation
     pub fn add_kill(
         &mut self,
         killer_team: u8,
@@ -471,40 +642,41 @@ impl GameSession {
             WagerError::InvalidKillTarget
         );
 
-        // Get player indices with validation
+        // Get player indices
         let killer_idx = self.get_player_index(killer_team, killer)?;
         let victim_idx = self.get_player_index(victim_team, victim)?;
 
-        // ATOMIC OPERATIONS: Get current values, validate, then update
-        let (victim_spawns, killer_kills) = match (killer_team, victim_team) {
+        // Get current values for atomic operation
+        let (current_victim_spawns, current_killer_kills) = match (killer_team, victim_team) {
             (0, 1) => {
-                let victim_spawns = self.team_b.player_spawns[victim_idx];
-                let killer_kills = self.team_a.player_kills[killer_idx];
-                (victim_spawns, killer_kills)
+                (self.team_b.player_spawns[victim_idx], self.team_a.player_kills[killer_idx])
             },
             (1, 0) => {
-                let victim_spawns = self.team_a.player_spawns[victim_idx];
-                let killer_kills = self.team_b.player_kills[killer_idx];
-                (victim_spawns, killer_kills)
+                (self.team_a.player_spawns[victim_idx], self.team_b.player_kills[killer_idx])
             },
             _ => return Err(error!(WagerError::InvalidTeam)),
         };
 
-        // Validate victim has spawns and killer won't overflow
-        require!(victim_spawns > 0, WagerError::PlayerHasNoSpawns);
-        validate_kill_count(killer_kills)?;
+        // Validate operation is possible
+        require!(current_victim_spawns > 0, WagerError::PlayerHasNoSpawns);
+        require!(
+            current_killer_kills < MAX_SAFE_KILLS,
+            WagerError::InvalidKillCount
+        );
+
+        validate_kill_count(current_killer_kills)?;
 
         // Perform atomic updates
         match (killer_team, victim_team) {
             (0, 1) => {
-                self.team_b.player_spawns[victim_idx] = victim_spawns - 1;
-                self.team_a.player_kills[killer_idx] = killer_kills
+                self.team_b.player_spawns[victim_idx] = current_victim_spawns - 1;
+                self.team_a.player_kills[killer_idx] = current_killer_kills
                     .checked_add(1)
                     .ok_or(WagerError::ArithmeticError)?;
             },
             (1, 0) => {
-                self.team_a.player_spawns[victim_idx] = victim_spawns - 1;
-                self.team_b.player_kills[killer_idx] = killer_kills
+                self.team_a.player_spawns[victim_idx] = current_victim_spawns - 1;
+                self.team_b.player_kills[killer_idx] = current_killer_kills
                     .checked_add(1)
                     .ok_or(WagerError::ArithmeticError)?;
             },
@@ -517,12 +689,15 @@ impl GameSession {
         Ok(())
     }
 
-    /// ENHANCED: Add spawns with comprehensive validation and consistent increment
+    /// FIXED: Add spawns with game mode specific increments
     pub fn add_spawns_safe(&mut self, team: u8, player_index: usize) -> Result<()> {
-        const SPAWN_INCREMENT: u8 = 10;
+        let spawn_increment = self.game_mode.spawn_increment();
         
         require!(team == 0 || team == 1, WagerError::InvalidTeam);
-        require!(player_index < self.game_mode.players_per_team(), WagerError::PlayerIndexOutOfBounds);
+        require!(
+            player_index < self.game_mode.players_per_team(),
+            WagerError::PlayerIndexOutOfBounds
+        );
 
         let current_spawns = match team {
             0 => self.team_a.player_spawns[player_index],
@@ -530,51 +705,57 @@ impl GameSession {
             _ => return Err(error!(WagerError::InvalidTeam)),
         };
 
-        // Validate spawn addition using utility function
-        validate_spawn_count(current_spawns, SPAWN_INCREMENT)?;
+        // Check if addition would exceed safe limits
+        let new_spawns = current_spawns
+            .checked_add(spawn_increment)
+            .ok_or(WagerError::ArithmeticError)?;
+            
+        require!(
+            new_spawns <= MAX_SAFE_SPAWNS,
+            WagerError::SpawnLimitExceeded
+        );
+
+        validate_spawn_count(current_spawns, spawn_increment)?;
 
         // Perform atomic update
         match team {
-            0 => {
-                self.team_a.player_spawns[player_index] = current_spawns
-                    .checked_add(SPAWN_INCREMENT)
-                    .ok_or(WagerError::ArithmeticError)?;
-            },
-            1 => {
-                self.team_b.player_spawns[player_index] = current_spawns
-                    .checked_add(SPAWN_INCREMENT)
-                    .ok_or(WagerError::ArithmeticError)?;
-            },
+            0 => self.team_a.player_spawns[player_index] = new_spawns,
+            1 => self.team_b.player_spawns[player_index] = new_spawns,
             _ => return Err(error!(WagerError::InvalidTeam)),
         }
 
-        // Update operation tracking
         self.update_operation_tracking()?;
-
         Ok(())
     }
 
-    /// Legacy method - redirects to safe version
+    /// Legacy wrapper
     pub fn add_spawns(&mut self, team: u8, player_index: usize) -> Result<()> {
         self.add_spawns_safe(team, player_index)
     }
     
-    /// ENHANCED: Check if player is already joined with cross-team validation
+    /// FIXED: Check if player already joined with proper validation
     pub fn is_player_already_joined(&self, player: Pubkey) -> Result<bool> {
         require!(player != Pubkey::default(), WagerError::InvalidPlayer);
         
         let player_count = self.game_mode.players_per_team();
         
-        Ok(self.team_a.contains_player(player, player_count) || 
-           self.team_b.contains_player(player, player_count))
+        let in_team_a = self.team_a.contains_player(player, player_count)?;
+        let in_team_b = self.team_b.contains_player(player, player_count)?;
+        
+        // Additional validation - player should not be in both teams
+        require!(
+            !(in_team_a && in_team_b),
+            WagerError::DuplicatePlayer
+        );
+        
+        Ok(in_team_a || in_team_b)
     }
     
-    /// ENHANCED: Safe timestamp validation with comprehensive checks
+    /// FIXED: Timestamp validation with overflow protection
     pub fn validate_not_expired_safe(&self) -> Result<()> {
         let clock = Clock::get()?;
         let current_time = clock.unix_timestamp;
         
-        // Validate timestamps are reasonable
         require!(
             current_time > 0 && self.created_at > 0,
             WagerError::InvalidTimestamp
@@ -585,9 +766,9 @@ impl GameSession {
             WagerError::InvalidTimestamp
         );
         
-        // Calculate age safely
-        let game_age = current_time.saturating_sub(self.created_at);
-        const GAME_TIMEOUT_SECONDS: i64 = 24 * 60 * 60; // 24 hours
+        let game_age = current_time
+            .checked_sub(self.created_at)
+            .ok_or(WagerError::ArithmeticError)?;
         
         require!(
             game_age <= GAME_TIMEOUT_SECONDS,
@@ -597,12 +778,12 @@ impl GameSession {
         Ok(())
     }
     
-    /// Legacy method for backward compatibility
+    /// Legacy wrapper
     pub fn validate_not_expired(&self) -> Result<()> {
         self.validate_not_expired_safe()
     }
     
-    /// ENHANCED: Comprehensive game session validation
+    /// ENHANCED: Comprehensive validation with integrity checks
     pub fn validate_integrity(&self) -> Result<()> {
         // Validate basic fields
         require!(
@@ -616,7 +797,7 @@ impl GameSession {
         );
 
         require!(
-            self.session_bet > 0,
+            self.session_bet >= MIN_SAFE_BET && self.session_bet <= MAX_SAFE_BET,
             WagerError::InvalidBetAmount
         );
 
@@ -627,7 +808,7 @@ impl GameSession {
         );
 
         // Validate session hash integrity
-        let expected_hash = crate::utils::generate_session_hash(
+        let expected_hash = generate_session_hash(
             &self.session_id,
             self.authority,
             self.created_at
@@ -638,12 +819,29 @@ impl GameSession {
             WagerError::SessionIdCollision
         );
 
-        // Validate team compositions if game is in progress or completed
+        // Validate team compositions if game is active
         if matches!(self.status, GameStatus::InProgress | GameStatus::Completed) {
             let player_count = self.game_mode.players_per_team();
             self.team_a.validate_composition(player_count)?;
             self.team_b.validate_composition(player_count)?;
+            
+            // Validate all player stats are within safe limits
+            for i in 0..player_count {
+                require!(
+                    self.team_a.player_kills[i] <= MAX_SAFE_KILLS &&
+                    self.team_a.player_spawns[i] <= MAX_SAFE_SPAWNS &&
+                    self.team_b.player_kills[i] <= MAX_SAFE_KILLS &&
+                    self.team_b.player_spawns[i] <= MAX_SAFE_SPAWNS,
+                    WagerError::InvalidKillCount
+                );
+            }
         }
+
+        // Validate operation counts are reasonable
+        require!(
+            self.operation_count < u64::MAX / 2, // Leave room for more operations
+            WagerError::ArithmeticError
+        );
 
         Ok(())
     }
@@ -658,34 +856,170 @@ impl GameSession {
         let mut team_b_spawns = 0u16;
 
         for i in 0..player_count {
+            let a_kills = self.team_a.player_kills[i];
+            let a_spawns = self.team_a.player_spawns[i];
+            let b_kills = self.team_b.player_kills[i];
+            let b_spawns = self.team_b.player_spawns[i];
+            
+            require!(
+                a_kills <= MAX_SAFE_KILLS && a_spawns <= MAX_SAFE_SPAWNS &&
+                b_kills <= MAX_SAFE_KILLS && b_spawns <= MAX_SAFE_SPAWNS,
+                WagerError::InvalidKillCount
+            );
+            
             team_a_kills = team_a_kills
-                .checked_add(self.team_a.player_kills[i] as u16)
+                .checked_add(a_kills as u16)
                 .ok_or(WagerError::ArithmeticError)?;
             team_a_spawns = team_a_spawns
-                .checked_add(self.team_a.player_spawns[i] as u16)
+                .checked_add(a_spawns as u16)
                 .ok_or(WagerError::ArithmeticError)?;
             team_b_kills = team_b_kills
-                .checked_add(self.team_b.player_kills[i] as u16)
+                .checked_add(b_kills as u16)
                 .ok_or(WagerError::ArithmeticError)?;
             team_b_spawns = team_b_spawns
-                .checked_add(self.team_b.player_spawns[i] as u16)
+                .checked_add(b_spawns as u16)
                 .ok_or(WagerError::ArithmeticError)?;
         }
+
+        let total_pot = self.team_a.total_bet
+            .checked_add(self.team_b.total_bet)
+            .ok_or(WagerError::ArithmeticError)?;
 
         Ok(GameStats {
             team_a_kills,
             team_a_spawns,
             team_b_kills,
             team_b_spawns,
-            total_pot: self.team_a.total_bet
-                .checked_add(self.team_b.total_bet)
-                .ok_or(WagerError::ArithmeticError)?,
+            total_pot,
             active_players: self.get_all_players().len() as u8,
         })
     }
+
+    /// ENHANCED: Validate earnings safety for all calculations
+    pub fn validate_earnings_safety(&self) -> Result<()> {
+        let player_count = self.game_mode.players_per_team();
+        
+        require!(
+            self.session_bet >= MIN_SAFE_BET && self.session_bet <= MAX_SAFE_BET,
+            WagerError::InvalidBetAmount
+        );
+        
+        // Check all player activity levels are safe
+        for i in 0..player_count {
+            let team_a_total = (self.team_a.player_kills[i] as u16)
+                .checked_add(self.team_a.player_spawns[i] as u16)
+                .ok_or(WagerError::ArithmeticError)?;
+                
+            let team_b_total = (self.team_b.player_kills[i] as u16)
+                .checked_add(self.team_b.player_spawns[i] as u16)
+                .ok_or(WagerError::ArithmeticError)?;
+            
+            // With our current limits, these will always be safe
+            require!(
+                team_a_total <= (MAX_SAFE_KILLS as u16 + MAX_SAFE_SPAWNS as u16) &&
+                team_b_total <= (MAX_SAFE_KILLS as u16 + MAX_SAFE_SPAWNS as u16),
+                WagerError::InvalidKillCount
+            );
+        }
+        
+        Ok(())
+    }
+
+    /// Get total safe activity across all players
+    pub fn get_total_safe_activity(&self) -> Result<u64> {
+        let team_a_activity = self.team_a.calculate_safe_total_activity(
+            self.game_mode.players_per_team()
+        )?;
+        
+        let team_b_activity = self.team_b.calculate_safe_total_activity(
+            self.game_mode.players_per_team()
+        )?;
+        
+        team_a_activity
+            .checked_add(team_b_activity)
+            .ok_or(error!(WagerError::ArithmeticError))
+    }
+
+    /// Validate all player earnings are calculable safely
+    pub fn validate_all_player_earnings_safety(&self) -> Result<()> {
+        let all_players = self.get_all_players();
+        
+        for player in all_players {
+            // This validates each player's earnings calculation
+            self.calculate_player_earnings_safe(player)?;
+        }
+        
+        Ok(())
+    }
+
+    /// SECURITY: Emergency pause function for administrators
+    pub fn emergency_pause(&mut self, authority: Pubkey) -> Result<()> {
+        require!(
+            authority == self.authority, // Only game authority can pause
+            WagerError::AuthorityMismatch
+        );
+        
+        require!(
+            !self.status.is_final(),
+            WagerError::InvalidGameState
+        );
+        
+        let current_nonce = self.nonce;
+        self.atomic_status_transition(GameStatus::EmergencyPaused, current_nonce)?;
+        
+        Ok(())
+    }
+
+    /// SECURITY: Resume from emergency pause
+    pub fn resume_from_pause(&mut self, authority: Pubkey) -> Result<()> {
+        require!(
+            authority == self.authority,
+            WagerError::AuthorityMismatch
+        );
+        
+        require!(
+            matches!(self.status, GameStatus::EmergencyPaused),
+            WagerError::InvalidGameState
+        );
+        
+        let current_nonce = self.nonce;
+        self.atomic_status_transition(GameStatus::InProgress, current_nonce)?;
+        
+        Ok(())
+    }
+
+    /// SECURITY: Validate session hasn't been tampered with
+    pub fn validate_session_integrity(&self) -> Result<()> {
+        // Recompute hash and verify
+        let expected_hash = generate_session_hash(
+            &self.session_id,
+            self.authority,
+            self.created_at
+        );
+        
+        require!(
+            self.session_hash == expected_hash,
+            WagerError::GameDataCorruption
+        );
+        
+        // Validate nonce hasn't been manipulated
+        require!(
+            self.nonce >= self.operation_count,
+            WagerError::GameDataCorruption
+        );
+        
+        // Validate timestamps are consistent
+        require!(
+            self.last_operation >= self.created_at &&
+            self.last_operation_window >= self.created_at,
+            WagerError::GameDataCorruption
+        );
+        
+        Ok(())
+    }
 }
 
-/// ENHANCED: Game statistics structure
+/// ENHANCED: Game statistics with validation
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct GameStats {
     pub team_a_kills: u16,
@@ -694,4 +1028,101 @@ pub struct GameStats {
     pub team_b_spawns: u16,
     pub total_pot: u64,
     pub active_players: u8,
+}
+
+impl GameStats {
+    /// Validate statistics are within safe bounds
+    pub fn validate_safe_bounds(&self) -> Result<()> {
+        let total_activity = (self.team_a_kills as u64)
+            .checked_add(self.team_a_spawns as u64)
+            .and_then(|sum| sum.checked_add(self.team_b_kills as u64))
+            .and_then(|sum| sum.checked_add(self.team_b_spawns as u64))
+            .ok_or(WagerError::ArithmeticError)?;
+        
+        // Maximum reasonable total activity
+        let max_reasonable = ((MAX_SAFE_KILLS as u64) + (MAX_SAFE_SPAWNS as u64)) * 10;
+        require!(
+            total_activity <= max_reasonable,
+            WagerError::InvalidKillCount
+        );
+        
+        // Validate pot size
+        require!(
+            self.total_pot <= MAX_SAFE_BET * 10, // Reasonable maximum pot
+            WagerError::InvalidBetAmount
+        );
+        
+        require!(
+            self.active_players <= 10, // Maximum 5v5
+            WagerError::InvalidPlayerCount
+        );
+        
+        Ok(())
+    }
+    
+    /// Get win ratio for team A (kills / total kills)
+    pub fn get_team_a_win_ratio(&self) -> Result<f64> {
+        let total_kills = (self.team_a_kills as u64)
+            .checked_add(self.team_b_kills as u64)
+            .ok_or(WagerError::ArithmeticError)?;
+            
+        if total_kills == 0 {
+            Ok(0.5) // Equal if no kills
+        } else {
+            Ok(self.team_a_kills as f64 / total_kills as f64)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_limits() {
+        // Verify our limits prevent overflow
+        let max_activity = (MAX_SAFE_KILLS as u64) + (MAX_SAFE_SPAWNS as u64);
+        let max_earnings = max_activity * MAX_SAFE_BET / 10;
+        
+        // Should not overflow u64
+        assert!(max_earnings < u64::MAX);
+        
+        // Should be reasonable for gameplay
+        assert!(MAX_SAFE_KILLS >= 50);
+        assert!(MAX_SAFE_SPAWNS >= 50);
+    }
+
+    #[test]
+    fn test_earnings_calculation_safety() {
+        // Test maximum values don't overflow
+        let max_activity = (MAX_SAFE_KILLS as u64) + (MAX_SAFE_SPAWNS as u64);
+        let product = max_activity.checked_mul(MAX_SAFE_BET);
+        assert!(product.is_some());
+        
+        let earnings = product.unwrap().checked_div(10);
+        assert!(earnings.is_some());
+        assert!(earnings.unwrap() < u64::MAX);
+    }
+
+    #[test]
+    fn test_game_mode_spawn_increments() {
+        assert_eq!(GameMode::PayToSpawnOneVsOne.spawn_increment(), 5);
+        assert_eq!(GameMode::PayToSpawnThreeVsThree.spawn_increment(), 8);
+        assert_eq!(GameMode::PayToSpawnFiveVsFive.spawn_increment(), 10);
+    }
+
+    #[test]
+    fn test_status_transitions() {
+        assert!(GameStatus::WaitingForPlayers.can_transition_to(&GameStatus::InProgress));
+        assert!(GameStatus::InProgress.can_transition_to(&GameStatus::Completed));
+        assert!(GameStatus::InProgress.can_transition_to(&GameStatus::EmergencyPaused));
+        assert!(!GameStatus::Completed.can_transition_to(&GameStatus::InProgress));
+    }
+
+    #[test]
+    fn test_bet_amount_validation() {
+        assert!(MIN_SAFE_BET > 0);
+        assert!(MAX_SAFE_BET >= MIN_SAFE_BET);
+        assert!(MAX_SAFE_BET <= u64::MAX / 1000); // Leave room for calculations
+    }
 }
