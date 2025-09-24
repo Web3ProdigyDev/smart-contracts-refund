@@ -25,6 +25,10 @@ pub mod wager_program {
         create_game_session_handler(ctx, session_id, bet_amount, game_mode)
     }
 
+    pub fn emergency_pause(ctx: Context<EmergencyPause>) -> Result<()> {
+        instructions::emergency_pause::emergency_pause(ctx)
+    }
+
     pub fn join_user(ctx: Context<JoinUser>, session_id: String, team: u8) -> Result<()> {
         join_user_handler(ctx, session_id, team)
     }

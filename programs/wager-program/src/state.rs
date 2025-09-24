@@ -908,7 +908,7 @@ impl GameSession {
         let clock = Clock::get()?;
         
         // Only allow clearing if operation has timed out (10 minutes)
-        if let Some(ref op) = self.current_operation {
+        if let Some(ref _op) = self.current_operation {
             if clock.unix_timestamp - self.operation_started_at < 600 {
                 return Err(error!(WagerError::ConcurrentOperation));
             }

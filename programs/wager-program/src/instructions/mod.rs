@@ -1,6 +1,7 @@
 // mod.rs - UPDATED MODULE DECLARATIONS
 pub mod create_game_session;
 pub mod distribute_winnings;
+pub mod emergency_pause;
 pub mod join_user;
 pub mod pay_to_spawn;
 pub mod record_kill;
@@ -9,6 +10,7 @@ pub mod refund_wager;
 // Re-export all instruction handlers for easy access
 pub use create_game_session::*;
 pub use distribute_winnings::*;
+pub use emergency_pause::*;
 pub use join_user::*;
 pub use pay_to_spawn::*;
 pub use record_kill::*;

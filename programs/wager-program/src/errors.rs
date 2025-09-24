@@ -1,4 +1,3 @@
-// errors.rs - ENHANCED ERROR TYPES WITH SECURITY CLASSIFICATIONS
 use anchor_lang::prelude::*;
 
 #[error_code]
@@ -26,6 +25,9 @@ pub enum WagerError {
 
     #[msg("Only the game authority can distribute winnings")]
     UnauthorizedDistribution,
+
+    #[msg("Only the game authority can pause the game")]
+    UnauthorizedPause,
 
     #[msg("Invalid winning team selection")]
     InvalidWinningTeam,
@@ -90,7 +92,6 @@ pub enum WagerError {
     #[msg("Game is not in progress")]
     GameNotInProgress,
 
-    // ENHANCED SECURITY ERROR TYPES WITH MORE SPECIFIC MESSAGES
     #[msg("Invalid session ID - must be 12-32 chars, alphanumeric with underscores/hyphens")]
     InvalidSessionId,
 
@@ -130,7 +131,6 @@ pub enum WagerError {
     #[msg("Invalid timestamp - negative or zero timestamps not allowed")]
     InvalidTimestamp,
 
-    // ENHANCED ERROR TYPES FOR BETTER SECURITY
     #[msg("Concurrent operation detected - please retry")]
     ConcurrentOperation,
 
@@ -215,53 +215,51 @@ impl WagerError {
     pub fn severity(&self) -> ErrorSeverity {
         match self {
             // Critical security errors
-            Self::GameDataCorruption | 
-            Self::ReplayAttack | 
-            Self::AccountSubstitution |
-            Self::InvalidSignature => ErrorSeverity::Critical,
-            
+            Self::GameDataCorruption
+            | Self::ReplayAttack
+            | Self::AccountSubstitution
+            | Self::InvalidSignature => ErrorSeverity::Critical,
+
             // High priority errors
-            Self::ConcurrentOperation |
-            Self::RateLimitExceeded |
-            Self::ArithmeticError |
-            Self::InvalidBetAmount |
-            Self::SessionIdCollision => ErrorSeverity::High,
-            
-            // Medium priority errors  
-            Self::InvalidGameState |
-            Self::DuplicatePlayer |
-            Self::InvalidKillCount |
-            Self::SpawnLimitExceeded => ErrorSeverity::Medium,
-            
+            Self::ConcurrentOperation
+            | Self::RateLimitExceeded
+            | Self::ArithmeticError
+            | Self::InvalidBetAmount
+            | Self::SessionIdCollision => ErrorSeverity::High,
+
+            // Medium priority errors
+            Self::InvalidGameState
+            | Self::DuplicatePlayer
+            | Self::InvalidKillCount
+            | Self::SpawnLimitExceeded => ErrorSeverity::Medium,
+
             // Low priority errors
-            Self::PlayerNotFound |
-            Self::TeamIsFull |
-            Self::InvalidPlayer => ErrorSeverity::Low,
-            
+            Self::PlayerNotFound | Self::TeamIsFull | Self::InvalidPlayer => ErrorSeverity::Low,
+
             // Default to medium for unlisted errors
             _ => ErrorSeverity::Medium,
         }
     }
-    
+
     /// Check if error should trigger emergency pause
     pub fn should_emergency_pause(&self) -> bool {
         matches!(
             self,
-            Self::GameDataCorruption |
-            Self::ReplayAttack |
-            Self::AccountSubstitution |
-            Self::CircuitBreakerActivated
+            Self::GameDataCorruption
+                | Self::ReplayAttack
+                | Self::AccountSubstitution
+                | Self::CircuitBreakerActivated
         )
     }
-    
+
     /// Check if error is retryable
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::ConcurrentOperation |
-            Self::RateLimitExceeded |
-            Self::InsufficientVaultFunds |
-            Self::InvalidGameState // Might be retryable depending on context
+            Self::ConcurrentOperation
+                | Self::RateLimitExceeded
+                | Self::InsufficientVaultFunds
+                | Self::InvalidGameState // Might be retryable depending on context
         )
     }
 }
@@ -270,7 +268,7 @@ impl WagerError {
 pub enum ErrorSeverity {
     Critical,
     High,
-    Medium, 
+    Medium,
     Low,
 }
 
@@ -278,7 +276,7 @@ impl ErrorSeverity {
     pub fn to_string(&self) -> &'static str {
         match self {
             Self::Critical => "CRITICAL",
-            Self::High => "HIGH", 
+            Self::High => "HIGH",
             Self::Medium => "MEDIUM",
             Self::Low => "LOW",
         }
@@ -291,12 +289,15 @@ mod tests {
 
     #[test]
     fn test_error_severity_classification() {
-        assert_eq!(WagerError::GameDataCorruption.severity(), ErrorSeverity::Critical);
+        assert_eq!(
+            WagerError::GameDataCorruption.severity(),
+            ErrorSeverity::Critical
+        );
         assert_eq!(WagerError::ArithmeticError.severity(), ErrorSeverity::High);
         assert_eq!(WagerError::PlayerNotFound.severity(), ErrorSeverity::Low);
     }
 
-    #[test] 
+    #[test]
     fn test_emergency_pause_triggers() {
         assert!(WagerError::GameDataCorruption.should_emergency_pause());
         assert!(WagerError::ReplayAttack.should_emergency_pause());
@@ -306,7 +307,7 @@ mod tests {
     #[test]
     fn test_retryable_errors() {
         assert!(WagerError::ConcurrentOperation.is_retryable());
-        assert!(WagerError::RateLimitExceeded.is_retryable()); 
+        assert!(WagerError::RateLimitExceeded.is_retryable());
         assert!(!WagerError::GameDataCorruption.is_retryable());
     }
 }
