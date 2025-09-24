@@ -29,6 +29,7 @@ pub mod wager_program {
         instructions::emergency_pause::emergency_pause(ctx)
     }
 
+
     pub fn join_user(ctx: Context<JoinUser>, session_id: String, team: u8) -> Result<()> {
         join_user_handler(ctx, session_id, team)
     }

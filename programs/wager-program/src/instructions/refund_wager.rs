@@ -1,5 +1,10 @@
 // refund_wager.rs - RACE CONDITION FIXED WITH COMPARE-AND-SWAP OPERATIONS
-use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_remaining_accounts_against_players, safe_add_u64}};
+use crate::{
+    errors::WagerError,
+    state::*,
+    utils::{safe_add_u64, validate_remaining_accounts_against_players, validate_session_id},
+    TOKEN_ID,
+};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
@@ -10,10 +15,10 @@ pub fn refund_wager_handler<'info>(
 ) -> Result<()> {
     let game_session = &mut ctx.accounts.game_session;
     let vault_bump = game_session.vault_bump;
-    
+
     // Validate session_id format
     validate_session_id(&session_id)?;
-    
+
     msg!("Starting Refund for session: {}", session_id);
 
     // CRITICAL FIX: Use compare-and-swap for atomic refund initiation
@@ -21,31 +26,41 @@ pub fn refund_wager_handler<'info>(
     let success = match game_session.status {
         GameStatus::WaitingForPlayers => {
             // Can refund from waiting state
+            let current_nonce = game_session.nonce; // Extract nonce before mutable borrow
             game_session.compare_and_swap_status(
                 GameStatus::WaitingForPlayers,
+                current_nonce, // Pass the current nonce
                 GameStatus::RefundInProgress,
-                Some("refund_from_waiting")
+                Some("refund_from_waiting"),
             )?
-        },
+        }
         GameStatus::InProgress => {
             // Can refund from in-progress (emergency refund)
+            let current_nonce = game_session.nonce; // Extract nonce before mutable borrow
+
             game_session.compare_and_swap_status(
                 GameStatus::InProgress,
+                current_nonce, // Pass the current nonce
                 GameStatus::RefundInProgress,
-                Some("emergency_refund")
+                Some("emergency_refund"),
             )?
-        },
+        }
         GameStatus::Expired => {
             // Can refund expired games
+            let current_nonce = game_session.nonce; // Extract nonce before mutable borrow
             game_session.compare_and_swap_status(
                 GameStatus::Expired,
+                current_nonce, // Pass the current nonce
                 GameStatus::RefundInProgress,
-                Some("refund_expired")
+                Some("refund_expired"),
             )?
-        },
+        }
         _ => {
             // Cannot refund from other states
-            msg!("Cannot refund from current status: {:?}", game_session.status);
+            msg!(
+                "Cannot refund from current status: {:?}",
+                game_session.status
+            );
             return Err(error!(WagerError::InvalidGameState));
         }
     };
@@ -63,9 +78,12 @@ pub fn refund_wager_handler<'info>(
         .into_iter()
         .filter(|p| *p != Pubkey::default())
         .collect();
-        
+
     msg!("Number of active players: {}", active_players.len());
-    msg!("Number of remaining accounts: {}", ctx.remaining_accounts.len());
+    msg!(
+        "Number of remaining accounts: {}",
+        ctx.remaining_accounts.len()
+    );
 
     // Enhanced validation for remaining accounts
     require!(
@@ -85,33 +103,40 @@ pub fn refund_wager_handler<'info>(
 
     // CRITICAL FIX: Enhanced refund calculation with comprehensive validation
     let refund_amount = game_session.session_bet;
-    
+
     // Validate refund amount is reasonable
     require!(refund_amount > 0, WagerError::InvalidBetAmount);
-    require!(refund_amount <= 100_000_000_000, WagerError::InvalidBetAmount); // Max 100K tokens
-    
+    require!(
+        refund_amount <= 100_000_000_000,
+        WagerError::InvalidBetAmount
+    ); // Max 100K tokens
+
     // Calculate total with safe arithmetic
     let mut total_refund: u64 = 0;
     for _ in 0..active_players.len() {
         total_refund = safe_add_u64(total_refund, refund_amount)?;
     }
-    
+
     // Pre-validate vault has sufficient balance with safety buffer
     let vault_balance = ctx.accounts.vault_token_account.amount;
     require!(
         vault_balance >= total_refund,
         WagerError::InsufficientVaultFunds
     );
-    
+
     // Additional safety buffer (1% extra) to handle any edge cases
     let safety_buffer = total_refund / 100;
     require!(
         vault_balance >= total_refund.saturating_add(safety_buffer),
         WagerError::InsufficientVaultFunds
     );
-    
-    msg!("Total refund required: {}, Vault balance: {}, Safety buffer: {}", 
-         total_refund, vault_balance, safety_buffer);
+
+    msg!(
+        "Total refund required: {}, Vault balance: {}, Safety buffer: {}",
+        total_refund,
+        vault_balance,
+        safety_buffer
+    );
 
     // CRITICAL FIX: Validate remaining accounts match active players exactly
     validate_remaining_accounts_against_players(&ctx.remaining_accounts, &active_players)?;
@@ -122,15 +147,19 @@ pub fn refund_wager_handler<'info>(
 
     // Perform refunds with comprehensive error handling
     for (player_idx, player) in active_players.iter().enumerate() {
-        msg!("Processing refund for player: {} (index: {})", player, player_idx);
+        msg!(
+            "Processing refund for player: {} (index: {})",
+            player,
+            player_idx
+        );
 
         // CRITICAL FIX: Strict player account lookup with bounds checking
         let player_account_idx = player_idx * 2;
         let token_account_idx = player_idx * 2 + 1;
-        
+
         require!(
-            player_account_idx < ctx.remaining_accounts.len() && 
-            token_account_idx < ctx.remaining_accounts.len(),
+            player_account_idx < ctx.remaining_accounts.len()
+                && token_account_idx < ctx.remaining_accounts.len(),
             WagerError::InvalidRemainingAccounts
         );
 
@@ -149,13 +178,14 @@ pub fn refund_wager_handler<'info>(
             WagerError::InvalidTokenMint
         );
 
-        require!(
-            player_account.key() == *player,
-            WagerError::InvalidPlayer
-        );
+        require!(player_account.key() == *player, WagerError::InvalidPlayer);
 
-        msg!("Refunding {} to player {} via token account {}", 
-             refund_amount, player, player_token_account_info.key());
+        msg!(
+            "Refunding {} to player {} via token account {}",
+            refund_amount,
+            player,
+            player_token_account_info.key()
+        );
 
         // Transfer tokens from vault to player with comprehensive error handling
         let transfer_result = anchor_spl::token::transfer(
@@ -183,13 +213,17 @@ pub fn refund_wager_handler<'info>(
             game_session.mark_refund_failed()?;
             return Err(e.into());
         }
-        
+
         // Track successful refund
         total_refunded = safe_add_u64(total_refunded, refund_amount)?;
         successful_refunds += 1;
-        
-        msg!("Successfully refunded {} tokens to player {} (total refunded so far: {})", 
-             refund_amount, player, total_refunded);
+
+        msg!(
+            "Successfully refunded {} tokens to player {} (total refunded so far: {})",
+            refund_amount,
+            player,
+            total_refunded
+        );
     }
 
     // CRITICAL FIX: Final validation ensures all refunds completed successfully
@@ -197,7 +231,7 @@ pub fn refund_wager_handler<'info>(
         total_refunded == total_refund,
         WagerError::IncompleteDistribution
     );
-    
+
     require!(
         successful_refunds == active_players.len(),
         WagerError::IncompleteDistribution
@@ -205,9 +239,12 @@ pub fn refund_wager_handler<'info>(
 
     // CRITICAL FIX: Mark refund as completed atomically
     game_session.mark_refund_completed()?;
-    
-    msg!("Refund completed successfully: {} tokens refunded to {} players", 
-         total_refunded, successful_refunds);
+
+    msg!(
+        "Refund completed successfully: {} tokens refunded to {} players",
+        total_refunded,
+        successful_refunds
+    );
 
     Ok(())
 }
