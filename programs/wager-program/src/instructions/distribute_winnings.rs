@@ -1,5 +1,11 @@
-// distribute_winnings.rs - ATOMIC OPERATIONS WITH RACE CONDITION PREVENTION
-use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_remaining_accounts_against_players, safe_multiply_and_divide}};
+use crate::{
+    errors::WagerError,
+    state::*,
+    utils::{
+        safe_multiply_and_divide, validate_remaining_accounts_against_players, validate_session_id,
+    },
+    TOKEN_ID,
+};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
@@ -10,151 +16,137 @@ pub fn distribute_pay_spawn_earnings<'info>(
 ) -> Result<()> {
     let game_session = &mut ctx.accounts.game_session;
     let vault_bump = game_session.vault_bump;
-    
-    // Validate session_id format FIRST
+
+    // Validate session_id format
     validate_session_id(&session_id)?;
-    
-    // CRITICAL RACE CONDITION FIX: Atomic status transition with nonce validation
+
+    // CRITICAL: Atomic status transition to DistributionInProgress
     let current_nonce = game_session.nonce;
-    
-    // ATOMIC OPERATION: Check current state and transition atomically
     require!(
         game_session.status == GameStatus::InProgress,
         WagerError::InvalidGameState
     );
-    
-    // IMMEDIATE atomic transition to prevent race conditions
-    game_session.atomic_status_transition(GameStatus::Completed, current_nonce)?;
-    
-    // Verify atomic transition succeeded
+
+    let success = game_session.compare_and_swap_status(
+        GameStatus::InProgress,
+        current_nonce,
+        GameStatus::DistributionInProgress,
+        Some("pay_spawn_distribution"),
+    )?;
+    require!(success, WagerError::ConcurrentOperation);
+
+    // Verify atomic transition
     require!(
-        game_session.status == GameStatus::Completed,
+        game_session.status == GameStatus::DistributionInProgress,
         WagerError::InvalidGameState
     );
-    
-    require!(
-        game_session.nonce == current_nonce + 1,
-        WagerError::ConcurrentOperation
-    );
-    
-    msg!("Distribution starting for session: {} (status atomically updated, nonce: {})", 
-         session_id, game_session.nonce);
 
-    // ENHANCED: Comprehensive validation before any transfers
+    msg!(
+        "Distribution starting for session: {} (status atomically updated, nonce: {})",
+        session_id,
+        game_session.nonce
+    );
+
+    // Comprehensive validation
     game_session.validate_integrity()?;
-    
+    game_session.validate_not_expired()?;
+
     let players = game_session.get_all_players();
     let active_players: Vec<Pubkey> = players
         .into_iter()
         .filter(|p| *p != Pubkey::default())
         .collect();
-        
-    msg!("Number of active players: {}", active_players.len());
-    msg!("Number of remaining accounts: {}", ctx.remaining_accounts.len());
 
-    // Enhanced validation for remaining accounts
+    msg!("Number of active players: {}", active_players.len());
+    msg!(
+        "Number of remaining accounts: {}",
+        ctx.remaining_accounts.len()
+    );
+
+    // Validate remaining accounts
     require!(
         !ctx.remaining_accounts.is_empty(),
         WagerError::InvalidRemainingAccounts
     );
-
     require!(
         ctx.remaining_accounts.len() % 2 == 0,
         WagerError::InvalidRemainingAccounts
     );
 
-    // Pre-validate vault balance before any calculations
+    // Pre-validate vault balance
     let initial_vault_balance = ctx.accounts.vault_token_account.amount;
-    require!(initial_vault_balance > 0, WagerError::InsufficientVaultFunds);
-    
-    // CRITICAL FIX: Calculate total required funds with comprehensive validation
+    require!(
+        initial_vault_balance > 0,
+        WagerError::InsufficientVaultFunds
+    );
+
+    // Calculate total required funds
     let mut total_required: u64 = 0;
     let mut player_earnings: Vec<(Pubkey, u64)> = Vec::new();
-    
+
     for player in active_players.iter().cloned() {
         if player == Pubkey::default() {
             continue;
         }
-        
+
         let kills_and_spawns = game_session.get_kills_and_spawns(player)?;
         if kills_and_spawns == 0 {
             continue;
         }
 
-        // CRITICAL FIX: Enhanced arithmetic with comprehensive bounds checking
         let kills_and_spawns_u64 = kills_and_spawns as u64;
-        
-        // Prevent manipulation by capping earnings to reasonable amount
         const MAX_EARNINGS_MULTIPLIER: u64 = 50;
         require!(
             kills_and_spawns_u64 <= MAX_EARNINGS_MULTIPLIER,
             WagerError::ArithmeticError
         );
-        
-        // Use safe utility function for multiplication and division
-        let earnings = safe_multiply_and_divide(
-            kills_and_spawns_u64,
-            game_session.session_bet,
-            10
-        )?;
-        
-        // Additional validation: earnings should be reasonable relative to bet
-        let max_reasonable_earnings = game_session.session_bet
+
+        let earnings =
+            safe_multiply_and_divide(kills_and_spawns_u64, game_session.session_bet, 10)?;
+        let max_reasonable_earnings = game_session
+            .session_bet
             .checked_mul(MAX_EARNINGS_MULTIPLIER)
             .ok_or(WagerError::ArithmeticError)?;
-        
         require!(
             earnings <= max_reasonable_earnings,
             WagerError::ArithmeticError
         );
-        
-        // CRITICAL FIX: Safe total accumulation with overflow protection
-        require!(
-            total_required <= u64::MAX - earnings,
-            WagerError::ArithmeticError
-        );
-            
+
         total_required = total_required
             .checked_add(earnings)
             .ok_or(WagerError::ArithmeticError)?;
-            
         player_earnings.push((player, earnings));
     }
-    
-    // CRITICAL FIX: Enhanced vault balance validation with fixed safety buffer
-    require!(
-        initial_vault_balance >= total_required,
-        WagerError::InsufficientVaultFunds
-    );
-    
-    // FIXED: Minimum safety buffer of 1000 tokens instead of percentage
+
+    // Validate vault balance with safety buffer
     let min_safety_buffer = 1000u64;
-    let percentage_buffer = total_required / 1000; // 0.1%
+    let percentage_buffer = total_required / 100; // 1%
     let safety_buffer = std::cmp::max(min_safety_buffer, percentage_buffer);
-    
     require!(
         initial_vault_balance >= total_required.saturating_add(safety_buffer),
         WagerError::InsufficientVaultFunds
     );
-    
-    msg!("Total required: {}, Vault balance: {}, Safety buffer: {}", 
-         total_required, initial_vault_balance, safety_buffer);
 
-    // Validate remaining accounts against earning players only
+    msg!(
+        "Total required: {}, Vault balance: {}, Safety buffer: {}",
+        total_required,
+        initial_vault_balance,
+        safety_buffer
+    );
+
+    // Validate remaining accounts against earning players
     let earning_players: Vec<Pubkey> = player_earnings.iter().map(|(pubkey, _)| *pubkey).collect();
     validate_remaining_accounts_against_players(&ctx.remaining_accounts, &earning_players)?;
 
-    // Track actual distributed amount for final validation
+    // Track distributed amount
     let mut total_distributed: u64 = 0;
     let mut successful_distributions: usize = 0;
 
-    // Perform distributions with comprehensive validation and rollback capability
     for (player, earnings) in player_earnings {
         if earnings == 0 {
             continue;
         }
 
-        // Find player account with strict validation
         let player_index = ctx
             .remaining_accounts
             .iter()
@@ -166,25 +158,23 @@ pub fn distribute_pay_spawn_earnings<'info>(
         let player_token_account_info = &ctx.remaining_accounts[player_index * 2 + 1];
         let player_token_account = Account::<TokenAccount>::try_from(player_token_account_info)?;
 
-        // CRITICAL FIX: Comprehensive token account validation
         require!(
             player_token_account.owner == player_account.key(),
             WagerError::InvalidPlayerTokenAccount
         );
-
         require!(
             player_token_account.mint == TOKEN_ID,
             WagerError::InvalidTokenMint
         );
+        require!(player_account.key() == player, WagerError::InvalidPlayer);
 
-        require!(
-            player_account.key() == player,
-            WagerError::InvalidPlayer
+        msg!(
+            "Transferring {} to player {} (index {})",
+            earnings,
+            player,
+            player_index
         );
 
-        msg!("Transferring {} to player {} (index {})", earnings, player, player_index);
-
-        // Enhanced transfer with better error handling
         let transfer_result = anchor_spl::token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -202,33 +192,32 @@ pub fn distribute_pay_spawn_earnings<'info>(
             ),
             earnings,
         );
-        
-        // Handle individual transfer failures
+
         if let Err(e) = transfer_result {
             msg!("Transfer failed for player {}: {:?}", player, e);
-            // Could implement partial refund logic here if needed
+            game_session.mark_distribution_failed()?;
             return Err(e.into());
         }
-        
-        // Track distributed amount
+
         total_distributed = total_distributed
             .checked_add(earnings)
             .ok_or(WagerError::ArithmeticError)?;
-        
         successful_distributions += 1;
     }
-    
-    // Final comprehensive validation
+
+    // Final validation
     require!(
         total_distributed == total_required,
         WagerError::IncompleteDistribution
     );
-    
     require!(
         successful_distributions == earning_players.len(),
         WagerError::IncompleteDistribution
     );
-    
+
+    // Mark distribution as completed
+    game_session.mark_distribution_completed()?;
+
     msg!("Distribution completed successfully:");
     msg!("  Total distributed: {} tokens", total_distributed);
     msg!("  Successful distributions: {}", successful_distributions);
@@ -243,36 +232,43 @@ pub fn distribute_all_winnings_handler<'info>(
     winning_team: u8,
 ) -> Result<()> {
     let game_session = &mut ctx.accounts.game_session;
-    
+
     // Validate session_id format
     validate_session_id(&session_id)?;
-    
-    msg!("Starting winner-take-all distribution for session: {}", session_id);
+
+    msg!(
+        "Starting winner-take-all distribution for session: {}",
+        session_id
+    );
 
     // Verify authority
     require!(
         game_session.authority == ctx.accounts.game_server.key(),
         WagerError::UnauthorizedDistribution
     );
-    
-    // CRITICAL RACE CONDITION FIX: Atomic status transition with nonce tracking
+
+    // CRITICAL: Atomic status transition to DistributionInProgress
     let current_nonce = game_session.nonce;
-    
     require!(
         game_session.status == GameStatus::InProgress,
         WagerError::InvalidGameState
     );
-    
-    // IMMEDIATE atomic transition
-    game_session.atomic_status_transition(GameStatus::Completed, current_nonce)?;
-    
+
+    let success = game_session.compare_and_swap_status(
+        GameStatus::InProgress,
+        current_nonce,
+        GameStatus::DistributionInProgress,
+        Some("winner_take_all_distribution"),
+    )?;
+    require!(success, WagerError::ConcurrentOperation);
+
     // Verify atomic transition
     require!(
-        game_session.status == GameStatus::Completed && game_session.nonce == current_nonce + 1,
-        WagerError::ConcurrentOperation
+        game_session.status == GameStatus::DistributionInProgress,
+        WagerError::InvalidGameState
     );
 
-    // Validate winning team selection
+    // Validate winning team
     require!(
         winning_team == 0 || winning_team == 1,
         WagerError::InvalidWinningTeam
@@ -281,7 +277,7 @@ pub fn distribute_all_winnings_handler<'info>(
     let players_per_team = game_session.game_mode.players_per_team();
     let vault_bump = game_session.vault_bump;
 
-    // CRITICAL FIX: Enhanced team validation
+    // Validate team composition
     require!(
         game_session.check_all_filled_secure()?,
         WagerError::NotAllPlayersJoined
@@ -294,12 +290,9 @@ pub fn distribute_all_winnings_handler<'info>(
         &game_session.team_b.players[0..players_per_team]
     };
 
-    // Validate no default/empty players in winning team
+    // Validate no default players
     for player in winning_players {
-        require!(
-            *player != Pubkey::default(),
-            WagerError::InvalidPlayer
-        );
+        require!(*player != Pubkey::default(), WagerError::InvalidPlayer);
     }
 
     require!(
@@ -307,44 +300,28 @@ pub fn distribute_all_winnings_handler<'info>(
         WagerError::InvalidRemainingAccounts
     );
 
-    // CRITICAL FIX: Enhanced arithmetic validation for payouts
+    // Calculate payout
     let session_bet = game_session.session_bet;
     let players_per_team_u64 = players_per_team as u64;
-    
     let winning_amount = session_bet
         .checked_mul(2)
         .ok_or(WagerError::ArithmeticError)?;
-    
     let total_payout = winning_amount
         .checked_mul(players_per_team_u64)
         .ok_or(WagerError::ArithmeticError)?;
-        
-    // Enhanced vault validation with fixed safety buffer
+
+    // Validate vault balance
     let vault_balance = ctx.accounts.vault_token_account.amount;
-    require!(
-        vault_balance >= total_payout,
-        WagerError::InsufficientVaultFunds
-    );
-    
     let min_safety_buffer = 1000u64;
-    let percentage_buffer = total_payout / 1000;
+    let percentage_buffer = total_payout / 100; // 1%
     let safety_buffer = std::cmp::max(min_safety_buffer, percentage_buffer);
-    
     require!(
         vault_balance >= total_payout.saturating_add(safety_buffer),
         WagerError::InsufficientVaultFunds
     );
 
-    // Validate remaining accounts match winning players exactly
-    for i in 0..players_per_team {
-        let expected_winner = winning_players[i];
-        let provided_account = &ctx.remaining_accounts[i * 2];
-        
-        require!(
-            provided_account.key() == expected_winner,
-            WagerError::InvalidWinner
-        );
-    }
+    // Validate remaining accounts
+    validate_remaining_accounts_against_players(&ctx.remaining_accounts, winning_players)?;
 
     let mut total_distributed: u64 = 0;
 
@@ -353,27 +330,28 @@ pub fn distribute_all_winnings_handler<'info>(
         let winner_token_account_info = &ctx.remaining_accounts[i * 2 + 1];
         let winner_token_account = Account::<TokenAccount>::try_from(winner_token_account_info)?;
 
-        // Enhanced winner validation
         require!(
             winner_token_account.owner == winner.key(),
             WagerError::InvalidWinnerTokenAccount
         );
-
         require!(
             winner_token_account.mint == TOKEN_ID,
             WagerError::InvalidTokenMint
         );
-
         let winner_pubkey = winner.key();
         require!(
             winning_players.iter().any(|&p| p == winner_pubkey),
             WagerError::InvalidWinner
         );
 
-        msg!("Transferring {} to winner {} (position {})", winning_amount, winner_pubkey, i);
+        msg!(
+            "Transferring {} to winner {} (position {})",
+            winning_amount,
+            winner_pubkey,
+            i
+        );
 
-        // Transfer tokens from vault to winner
-        anchor_spl::token::transfer(
+        let transfer_result = anchor_spl::token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 anchor_spl::token::Transfer {
@@ -389,19 +367,28 @@ pub fn distribute_all_winnings_handler<'info>(
                 ]],
             ),
             winning_amount,
-        )?;
-        
+        );
+
+        if let Err(e) = transfer_result {
+            msg!("Transfer failed for winner {}: {:?}", winner_pubkey, e);
+            game_session.mark_distribution_failed()?;
+            return Err(e.into());
+        }
+
         total_distributed = total_distributed
             .checked_add(winning_amount)
             .ok_or(WagerError::ArithmeticError)?;
     }
-    
+
     // Final validation
     require!(
         total_distributed == total_payout,
         WagerError::IncompleteDistribution
     );
-    
+
+    // Mark distribution as completed
+    game_session.mark_distribution_completed()?;
+
     msg!("Winner-take-all distribution completed:");
     msg!("  Total distributed: {} tokens", total_distributed);
     msg!("  Winners on team: {}", winning_team);
@@ -414,17 +401,14 @@ pub fn distribute_all_winnings_handler<'info>(
 #[derive(Accounts)]
 #[instruction(session_id: String)]
 pub struct DistributeWinnings<'info> {
-    /// The game server authority that created the session
     #[account(
         constraint = game_server.is_signer @ WagerError::UnauthorizedDistribution,
     )]
     pub game_server: Signer<'info>,
-
-    // ENHANCED: PDA with comprehensive validation
     #[account(
         mut,
         seeds = [
-            b"game_session", 
+            b"game_session",
             session_id.as_bytes(),
             game_server.key().as_ref()
         ],
@@ -433,32 +417,30 @@ pub struct DistributeWinnings<'info> {
         constraint = game_session.session_id == session_id @ WagerError::InvalidSessionId,
     )]
     pub game_session: Account<'info, GameSession>,
-
-    /// CHECK: Vault PDA with enhanced validation
+    /// CHECK: This is a PDA (Program Derived Address) used as the authority for token transfers.
+    /// It's validated through the seeds constraint which ensures it's derived from the correct
+    /// session_id and game_server. The PDA serves as a secure vault authority and doesn't need
+    /// additional type validation since it's only used for signing token transfers, not data access.
     #[account(
         mut,
         seeds = [
-            b"vault", 
+            b"vault",
             session_id.as_bytes(),
             game_server.key().as_ref()
         ],
         bump = game_session.vault_bump,
     )]
     pub vault: AccountInfo<'info>,
-
     #[account(
         mut,
         associated_token::mint = TOKEN_ID,
         associated_token::authority = vault,
-        constraint = vault_token_account.mint == TOKEN_ID @ WagerError::InvalidTokenMint,
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
-
     #[account(
         constraint = token_program.key() == anchor_spl::token::ID @ WagerError::InvalidTokenProgram,
     )]
     pub token_program: Program<'info, Token>,
-    
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }

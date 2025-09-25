@@ -1,15 +1,20 @@
 // pay_to_spawn.rs - RACE CONDITION FIXED WITH ATOMIC OPERATIONS AND BETTER BOUNDS CHECKING
-use crate::{errors::WagerError, state::*, TOKEN_ID, utils::{validate_session_id, validate_bet_amount, validate_spawn_count}};
+use crate::{
+    errors::WagerError,
+    state::*,
+    utils::{validate_bet_amount, validate_session_id, validate_spawn_count},
+    TOKEN_ID,
+};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
 
 pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: u8) -> Result<()> {
     let game_session = &mut ctx.accounts.game_session;
-    
+
     // CRITICAL FIX: Enhanced validation sequence - all validations before any state changes
     validate_session_id(&session_id)?;
-    
+
     // CRITICAL FIX: Comprehensive game state validation with integrity check
     game_session.validate_integrity()?;
     game_session.validate_not_expired_safe()?;
@@ -26,20 +31,20 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
     // CRITICAL FIX: Enhanced player verification with comprehensive bounds checking
     let player_key = ctx.accounts.user.key();
     require!(player_key != Pubkey::default(), WagerError::InvalidPlayer);
-    
+
     let player_index = game_session.get_player_index(team, player_key)?;
-    
+
     // Validate player index is within bounds for the game mode
     let max_players = game_session.game_mode.players_per_team();
     require!(
         player_index < max_players,
         WagerError::PlayerIndexOutOfBounds
     );
-    
+
     // CRITICAL FIX: Atomic operation lock to prevent concurrent spawn purchases
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;
-    
+
     // Check if any operation is currently in progress for this session
     if let Some(ref current_op) = game_session.current_operation {
         // Check if operation has timed out (30 seconds for spawn operations)
@@ -50,12 +55,16 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
             return Err(error!(WagerError::ConcurrentOperation));
         }
     }
-    
+
     // Set operation lock for this spawn purchase
-    let operation_id = format!("spawn_{}_{}", team, player_key.to_string()[0..8].to_string());
+    let operation_id = format!(
+        "spawn_{}_{}",
+        team,
+        player_key.to_string()[0..8].to_string()
+    );
     game_session.current_operation = Some(operation_id.clone());
     game_session.operation_started_at = current_time;
-    
+
     // ATOMIC OPERATION: Get current spawn count and validate increment atomically
     let current_spawns = match team {
         0 => game_session.team_a.player_spawns[player_index],
@@ -65,7 +74,7 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
             return Err(error!(WagerError::InvalidTeam));
         }
     };
-    
+
     // CRITICAL FIX: Use utility function for comprehensive spawn validation
     const SPAWN_INCREMENT: u8 = 10;
     if let Err(e) = validate_spawn_count(current_spawns, SPAWN_INCREMENT) {
@@ -75,27 +84,24 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
 
     let session_bet = game_session.session_bet;
     validate_bet_amount(session_bet)?; // Additional validation
-    
+
     // CRITICAL FIX: Enhanced financial validation with comprehensive buffer checks
     let user_balance = ctx.accounts.user_token_account.amount;
-    require!(
-        user_balance >= session_bet,
-        WagerError::InsufficientFunds
-    );
-    
+    require!(user_balance >= session_bet, WagerError::InsufficientFunds);
+
     // Enhanced buffer validation - ensure user keeps reasonable amount for future operations
     let min_buffer = std::cmp::max(session_bet / 10, 1000u64); // At least 10% or 1000 tokens
     require!(
         user_balance >= session_bet.saturating_add(min_buffer),
         WagerError::InsufficientFunds
     );
-    
+
     // CRITICAL FIX: Comprehensive token account validation (before state changes)
     require!(
         ctx.accounts.user_token_account.owner == ctx.accounts.user.key(),
         WagerError::InvalidPlayerTokenAccount
     );
-    
+
     require!(
         ctx.accounts.user_token_account.mint == TOKEN_ID,
         WagerError::InvalidTokenMint
@@ -103,22 +109,22 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
 
     // ENHANCED: Validate vault token account state before transfer
     require!(
-        ctx.accounts.vault_token_account.mint == TOKEN_ID &&
-        ctx.accounts.vault_token_account.owner == ctx.accounts.vault.key(),
+        ctx.accounts.vault_token_account.mint == TOKEN_ID
+            && ctx.accounts.vault_token_account.owner == ctx.accounts.vault.key(),
         WagerError::InvalidPlayerTokenAccount
     );
 
     // CRITICAL FIX: ATOMIC STATE UPDATE - Update spawns FIRST (before token transfer)
     // This ensures state consistency even if token transfer fails
     let original_spawns = current_spawns;
-    
+
     // Perform the spawn addition atomically
     let add_result = game_session.add_spawns_safe(team, player_index);
     if let Err(e) = add_result {
         game_session.current_operation = None; // Clear lock on error
         return Err(e);
     }
-    
+
     // Verify spawn addition was successful (atomic verification)
     let new_spawns = match team {
         0 => game_session.team_a.player_spawns[player_index],
@@ -128,19 +134,25 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
             return Err(error!(WagerError::InvalidTeam));
         }
     };
-    
+
     require!(
         new_spawns == original_spawns + SPAWN_INCREMENT,
         WagerError::GameDataCorruption
     );
 
-    msg!("Spawn purchase validated - Player {} on team {} purchasing {} spawns (from {} to {})", 
-         player_key, team, SPAWN_INCREMENT, original_spawns, new_spawns);
+    msg!(
+        "Spawn purchase validated - Player {} on team {} purchasing {} spawns (from {} to {})",
+        player_key,
+        team,
+        SPAWN_INCREMENT,
+        original_spawns,
+        new_spawns
+    );
 
     // CRITICAL FIX: Enhanced vault balance tracking for atomic verification
     let vault_balance_before = ctx.accounts.vault_token_account.amount;
     let user_balance_before = ctx.accounts.user_token_account.amount;
-    
+
     // ATOMIC TOKEN TRANSFER with comprehensive error handling
     let transfer_result = anchor_spl::token::transfer(
         CpiContext::new(
@@ -160,33 +172,35 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
         match team {
             0 => game_session.team_a.player_spawns[player_index] = original_spawns,
             1 => game_session.team_b.player_spawns[player_index] = original_spawns,
-            _ => {},
+            _ => {}
         }
         // Clear operation lock
         game_session.current_operation = None;
         game_session.operation_started_at = 0;
         return Err(e.into());
     }
-    
+
     // CRITICAL FIX: Post-transfer atomic verification
     ctx.accounts.vault_token_account.reload()?;
     ctx.accounts.user_token_account.reload()?;
-    
+
     let vault_balance_after = ctx.accounts.vault_token_account.amount;
     let user_balance_after = ctx.accounts.user_token_account.amount;
-    
+
     // Comprehensive balance verification
     require!(
-        vault_balance_after == vault_balance_before
-            .checked_add(session_bet)
-            .ok_or(WagerError::ArithmeticError)?,
+        vault_balance_after
+            == vault_balance_before
+                .checked_add(session_bet)
+                .ok_or(WagerError::ArithmeticError)?,
         WagerError::VaultBalanceMismatch
     );
-    
+
     require!(
-        user_balance_after == user_balance_before
-            .checked_sub(session_bet)
-            .ok_or(WagerError::ArithmeticError)?,
+        user_balance_after
+            == user_balance_before
+                .checked_sub(session_bet)
+                .ok_or(WagerError::ArithmeticError)?,
         WagerError::TokenTransferFailed
     );
 
@@ -200,14 +214,13 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
         }
     };
 
-    // CRITICAL FIX: Add explicit bounds checking for team total bet
-    const MAX_TEAM_TOTAL_BET: u64 = MAX_BET * 100; // Conservative limit: 100x max individual bet
+    // CRITICAL FIX: Add explicit bounds checking for team total bet using constant
     let new_team_bet = current_team_bet
         .checked_add(session_bet)
         .ok_or(WagerError::ArithmeticError)?;
-    
+
     require!(
-        new_team_bet <= MAX_TEAM_TOTAL_BET,
+        new_team_bet <= crate::state::MAX_TEAM_BET,
         WagerError::ArithmeticError
     );
 
@@ -231,8 +244,16 @@ pub fn pay_to_spawn_handler(ctx: Context<PayToSpawn>, session_id: String, team: 
     msg!("  Spawns purchased: {}", SPAWN_INCREMENT);
     msg!("  Total spawns now: {}", new_spawns);
     msg!("  Cost: {}", session_bet);
-    msg!("  Vault balance: {} -> {}", vault_balance_before, vault_balance_after);
-    msg!("  User balance: {} -> {}", user_balance_before, user_balance_after);
+    msg!(
+        "  Vault balance: {} -> {}",
+        vault_balance_before,
+        vault_balance_after
+    );
+    msg!(
+        "  User balance: {} -> {}",
+        user_balance_before,
+        user_balance_after
+    );
     msg!("  Team total bet: {} -> {}", current_team_bet, new_team_bet);
     msg!("  Session nonce: {}", game_session.nonce);
 
@@ -267,7 +288,10 @@ pub struct PayToSpawn<'info> {
         constraint = game_session.authority == game_server.key() @ WagerError::AuthorityMismatch,
     )]
     pub game_session: Account<'info, GameSession>,
-
+    /// CHECK: This is a PDA (Program Derived Address) used as the authority for token transfers.
+    /// It's validated through the seeds constraint which ensures it's derived from the correct
+    /// session_id and game_server. The PDA serves as a secure vault authority and doesn't need
+    /// additional type validation since it's only used for signing token transfers, not data access.
     #[account(
         mut,
         constraint = user_token_account.owner == user.key() @ WagerError::InvalidPlayerTokenAccount,
@@ -300,7 +324,7 @@ pub struct PayToSpawn<'info> {
         constraint = token_program.key() == anchor_spl::token::ID @ WagerError::InvalidTokenProgram,
     )]
     pub token_program: Program<'info, Token>,
-    
+
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }

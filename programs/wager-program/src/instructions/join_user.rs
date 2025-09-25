@@ -122,9 +122,8 @@ pub fn join_user_handler(ctx: Context<JoinUser>, session_id: String, team: u8) -
         .ok_or(WagerError::ArithmeticError)?;
 
     // CRITICAL FIX: Additional validation - ensure total bet doesn't exceed safe limits
-    const MAX_TEAM_BET: u64 = MAX_BET * 5; // Max 5 players per team
     require!(
-        selected_team.total_bet <= MAX_TEAM_BET,
+        selected_team.total_bet <= crate::state::MAX_TEAM_BET,
         WagerError::ArithmeticError
     );
 
@@ -184,6 +183,10 @@ pub struct JoinUser<'info> {
         bump = game_session.bump,
     )]
     pub game_session: Account<'info, GameSession>,
+    /// CHECK: This is a PDA (Program Derived Address) used as the authority for token transfers.
+    /// It's validated through the seeds constraint which ensures it's derived from the correct
+    /// session_id and game_server. The PDA serves as a secure vault authority and doesn't need
+    /// additional type validation since it's only used for signing token transfers, not data access.
 
     #[account(
         mut,

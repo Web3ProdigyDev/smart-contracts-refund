@@ -1,4 +1,3 @@
-// refund_wager.rs - RACE CONDITION FIXED WITH COMPARE-AND-SWAP OPERATIONS
 use crate::{
     errors::WagerError,
     state::*,
@@ -19,44 +18,30 @@ pub fn refund_wager_handler<'info>(
     // Validate session_id format
     validate_session_id(&session_id)?;
 
-    msg!("Starting Refund for session: {}", session_id);
+    msg!("Starting refund for session: {}", session_id);
 
-    // CRITICAL FIX: Use compare-and-swap for atomic refund initiation
-    // This prevents double refunds and race conditions
+    // Atomic refund initiation
+    let current_nonce = game_session.nonce;
     let success = match game_session.status {
-        GameStatus::WaitingForPlayers => {
-            // Can refund from waiting state
-            let current_nonce = game_session.nonce; // Extract nonce before mutable borrow
-            game_session.compare_and_swap_status(
-                GameStatus::WaitingForPlayers,
-                current_nonce, // Pass the current nonce
-                GameStatus::RefundInProgress,
-                Some("refund_from_waiting"),
-            )?
-        }
-        GameStatus::InProgress => {
-            // Can refund from in-progress (emergency refund)
-            let current_nonce = game_session.nonce; // Extract nonce before mutable borrow
-
-            game_session.compare_and_swap_status(
-                GameStatus::InProgress,
-                current_nonce, // Pass the current nonce
-                GameStatus::RefundInProgress,
-                Some("emergency_refund"),
-            )?
-        }
-        GameStatus::Expired => {
-            // Can refund expired games
-            let current_nonce = game_session.nonce; // Extract nonce before mutable borrow
-            game_session.compare_and_swap_status(
-                GameStatus::Expired,
-                current_nonce, // Pass the current nonce
-                GameStatus::RefundInProgress,
-                Some("refund_expired"),
-            )?
-        }
+        GameStatus::WaitingForPlayers => game_session.compare_and_swap_status(
+            GameStatus::WaitingForPlayers,
+            current_nonce,
+            GameStatus::RefundInProgress,
+            Some("refund_from_waiting"),
+        )?,
+        GameStatus::InProgress => game_session.compare_and_swap_status(
+            GameStatus::InProgress,
+            current_nonce,
+            GameStatus::RefundInProgress,
+            Some("emergency_refund"),
+        )?,
+        GameStatus::Expired => game_session.compare_and_swap_status(
+            GameStatus::Expired,
+            current_nonce,
+            GameStatus::RefundInProgress,
+            Some("refund_expired"),
+        )?,
         _ => {
-            // Cannot refund from other states
             msg!(
                 "Cannot refund from current status: {:?}",
                 game_session.status
@@ -65,13 +50,12 @@ pub fn refund_wager_handler<'info>(
         }
     };
 
-    if !success {
-        return Err(error!(WagerError::ConcurrentOperation));
-    }
+    require!(success, WagerError::ConcurrentOperation);
 
-    // At this point, we've atomically transitioned to RefundInProgress
-    // No other thread can start a refund or distribution
-    msg!("Refund status atomically set to RefundInProgress");
+    msg!(
+        "Refund status atomically set to RefundInProgress (nonce: {})",
+        game_session.nonce
+    );
 
     let players = game_session.get_all_players();
     let active_players: Vec<Pubkey> = players
@@ -85,47 +69,38 @@ pub fn refund_wager_handler<'info>(
         ctx.remaining_accounts.len()
     );
 
-    // Enhanced validation for remaining accounts
+    // Validate remaining accounts
     require!(
         !ctx.remaining_accounts.is_empty(),
         WagerError::InvalidRemainingAccounts
     );
-
     require!(
         ctx.remaining_accounts.len() % 2 == 0,
         WagerError::InvalidRemainingAccounts
     );
-
     require!(
         ctx.remaining_accounts.len() == active_players.len() * 2,
         WagerError::InvalidRemainingAccounts
     );
 
-    // CRITICAL FIX: Enhanced refund calculation with comprehensive validation
+    // Calculate total refund
     let refund_amount = game_session.session_bet;
-
-    // Validate refund amount is reasonable
     require!(refund_amount > 0, WagerError::InvalidBetAmount);
     require!(
         refund_amount <= 100_000_000_000,
         WagerError::InvalidBetAmount
-    ); // Max 100K tokens
+    );
 
-    // Calculate total with safe arithmetic
     let mut total_refund: u64 = 0;
     for _ in 0..active_players.len() {
         total_refund = safe_add_u64(total_refund, refund_amount)?;
     }
 
-    // Pre-validate vault has sufficient balance with safety buffer
+    // Validate vault balance
     let vault_balance = ctx.accounts.vault_token_account.amount;
-    require!(
-        vault_balance >= total_refund,
-        WagerError::InsufficientVaultFunds
-    );
-
-    // Additional safety buffer (1% extra) to handle any edge cases
-    let safety_buffer = total_refund / 100;
+    let min_safety_buffer = 1000u64;
+    let percentage_buffer = total_refund / 100; // 1%
+    let safety_buffer = std::cmp::max(min_safety_buffer, percentage_buffer);
     require!(
         vault_balance >= total_refund.saturating_add(safety_buffer),
         WagerError::InsufficientVaultFunds
@@ -138,22 +113,14 @@ pub fn refund_wager_handler<'info>(
         safety_buffer
     );
 
-    // CRITICAL FIX: Validate remaining accounts match active players exactly
+    // Validate remaining accounts
     validate_remaining_accounts_against_players(&ctx.remaining_accounts, &active_players)?;
 
-    // Track actual refunded amount for validation
+    // Perform refunds
     let mut total_refunded: u64 = 0;
     let mut successful_refunds: usize = 0;
 
-    // Perform refunds with comprehensive error handling
     for (player_idx, player) in active_players.iter().enumerate() {
-        msg!(
-            "Processing refund for player: {} (index: {})",
-            player,
-            player_idx
-        );
-
-        // CRITICAL FIX: Strict player account lookup with bounds checking
         let player_account_idx = player_idx * 2;
         let token_account_idx = player_idx * 2 + 1;
 
@@ -167,17 +134,14 @@ pub fn refund_wager_handler<'info>(
         let player_token_account_info = &ctx.remaining_accounts[token_account_idx];
         let player_token_account = Account::<TokenAccount>::try_from(player_token_account_info)?;
 
-        // CRITICAL FIX: Comprehensive token account validation
         require!(
             player_token_account.owner == player_account.key(),
             WagerError::InvalidPlayerTokenAccount
         );
-
         require!(
             player_token_account.mint == TOKEN_ID,
             WagerError::InvalidTokenMint
         );
-
         require!(player_account.key() == *player, WagerError::InvalidPlayer);
 
         msg!(
@@ -187,7 +151,6 @@ pub fn refund_wager_handler<'info>(
             player_token_account_info.key()
         );
 
-        // Transfer tokens from vault to player with comprehensive error handling
         let transfer_result = anchor_spl::token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -206,38 +169,27 @@ pub fn refund_wager_handler<'info>(
             refund_amount,
         );
 
-        // Handle transfer failure
         if let Err(e) = transfer_result {
             msg!("Transfer failed for player {}: {:?}", player, e);
-            // Mark refund as failed atomically
             game_session.mark_refund_failed()?;
             return Err(e.into());
         }
 
-        // Track successful refund
         total_refunded = safe_add_u64(total_refunded, refund_amount)?;
         successful_refunds += 1;
-
-        msg!(
-            "Successfully refunded {} tokens to player {} (total refunded so far: {})",
-            refund_amount,
-            player,
-            total_refunded
-        );
     }
 
-    // CRITICAL FIX: Final validation ensures all refunds completed successfully
+    // Final validation
     require!(
         total_refunded == total_refund,
         WagerError::IncompleteDistribution
     );
-
     require!(
         successful_refunds == active_players.len(),
         WagerError::IncompleteDistribution
     );
 
-    // CRITICAL FIX: Mark refund as completed atomically
+    // Mark refund as completed
     game_session.mark_refund_completed()?;
 
     msg!(
@@ -252,14 +204,14 @@ pub fn refund_wager_handler<'info>(
 #[derive(Accounts)]
 #[instruction(session_id: String)]
 pub struct RefundWager<'info> {
-    /// The game server authority that created the session
+    #[account(
+        constraint = game_server.is_signer @ WagerError::UnauthorizedDistribution,
+    )]
     pub game_server: Signer<'info>,
-
-    // ENHANCED: PDA with authority in seeds
     #[account(
         mut,
         seeds = [
-            b"game_session", 
+            b"game_session",
             session_id.as_bytes(),
             game_server.key().as_ref()
         ],
@@ -267,26 +219,26 @@ pub struct RefundWager<'info> {
         constraint = game_session.authority == game_server.key() @ WagerError::UnauthorizedDistribution,
     )]
     pub game_session: Account<'info, GameSession>,
-
-    /// CHECK: Vault PDA derived from session_id and authority - used only for token transfers
+    /// CHECK: This is a PDA (Program Derived Address) used as the authority for token transfers.
+    /// It's validated through the seeds constraint which ensures it's derived from the correct
+    /// session_id and game_server. The PDA serves as a secure vault authority and doesn't need
+    /// additional type validation since it's only used for signing token transfers, not data access.
     #[account(
         mut,
         seeds = [
-            b"vault", 
+            b"vault",
             session_id.as_bytes(),
             game_server.key().as_ref()
         ],
         bump = game_session.vault_bump,
     )]
     pub vault: AccountInfo<'info>,
-
     #[account(
         mut,
         associated_token::mint = TOKEN_ID,
-        associated_token::authority = vault
+        associated_token::authority = vault,
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
-
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,

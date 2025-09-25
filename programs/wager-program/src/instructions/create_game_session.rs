@@ -132,7 +132,10 @@ pub struct CreateGameSession<'info> {
         constraint = session_id.len() >= 12 && session_id.len() <= 32 @ WagerError::InvalidSessionId,
     )]
     pub game_session: Account<'info, GameSession>,
-    /// CHECK: Vault PDA with validation in handler
+    /// CHECK: This is a PDA (Program Derived Address) used as the authority for token transfers.
+    /// It's validated through the seeds constraint which ensures it's derived from the correct
+    /// session_id and game_server. The PDA serves as a secure vault authority and doesn't need
+    /// additional type validation since it's only used for signing token transfers, not data access.
     #[account(
         init,
         payer = game_server,

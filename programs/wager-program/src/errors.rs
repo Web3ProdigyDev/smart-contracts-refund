@@ -208,6 +208,14 @@ pub enum WagerError {
 
     #[msg("Value too large - exceeds maximum safe limits")]
     ValueTooLarge,
+    //     #[msg("Circuit breaker activated - system protection engaged")]
+    // CircuitBreakerActivated,
+
+    // #[msg("Value too large - exceeds maximum safe limits")]
+    // ValueTooLarge,
+
+    // #[msg("Security violation detected")]
+    // SecurityViolation,
 }
 
 impl WagerError {

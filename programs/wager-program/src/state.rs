@@ -4,13 +4,14 @@ use anchor_lang::prelude::*;
 use std::collections::HashSet;
 
 pub const MAX_KILLS: u8 = 50;
-pub const MAX_SPAWNS: u8 = 50;
-pub const MAX_BET: u64 = 100_000_000;
-pub const MIN_BET: u64 = 1_000_000;
+pub const MAX_SPAWNS: u8 = 100; // Fixed from 50 to 100 to match usage
+pub const MAX_BET: u64 = 1_000_000_000_000; // 1M tokens (matches validation)
+pub const MIN_BET: u64 = 1_000_000; // 1 token (matches validation)
 pub const GAME_TIMEOUT_SECONDS: i64 = 24 * 60 * 60;
 pub const MAX_OPERATIONS_PER_MINUTE: u64 = 60;
 pub const MAX_TOTAL_ACTIVITY: u64 = (MAX_KILLS as u64) + (MAX_SPAWNS as u64);
 pub const SCALING_FACTOR: u64 = 1_000_000;
+pub const MAX_TEAM_BET: u64 = MAX_BET * 5; // Add this new constant
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Debug)]
 pub enum DistributionStatus {
@@ -251,7 +252,6 @@ pub struct GameSession {
     pub last_distribution_attempt: i64,
     pub current_operation: Option<String>,
     pub operation_started_at: i64,
-    pub locked: bool,
 }
 
 impl GameSession {
@@ -279,8 +279,7 @@ impl GameSession {
         + 8
         + 4
         + 32
-        + 8
-        + 1;
+        + 8;
 
     pub fn compare_and_swap_status(
         &mut self,
@@ -292,21 +291,26 @@ impl GameSession {
         let clock = Clock::get()?;
         let current_time = clock.unix_timestamp;
 
-        // Check if account is already locked
-        if self.locked {
-            msg!(
-                "CAS failed: account is locked, operation={:?}",
-                self.current_operation
-            );
-            return Err(error!(WagerError::ConcurrentOperation));
+        // Check for concurrent operations using operation tracking
+        if let Some(ref current_op) = self.current_operation {
+            let timeout_duration = match current_op.as_str() {
+                op if op.contains("distribution") || op.contains("refund") => 300, // 5 minutes
+                _ => 120,                                                          // 2 minutes
+            };
+            if current_time - self.operation_started_at < timeout_duration {
+                msg!(
+                    "CAS failed: operation {} in progress, time remaining={}s",
+                    current_op,
+                    timeout_duration - (current_time - self.operation_started_at)
+                );
+                return Err(error!(WagerError::ConcurrentOperation));
+            }
+            // Clear expired operation
+            self.current_operation = None;
+            self.operation_started_at = 0;
         }
 
-        // Lock the account FIRST
-        self.locked = true;
-        self.current_operation = operation_type.map(|s| s.to_string());
-        self.operation_started_at = current_time;
-
-        // Check status and nonce after locking
+        // Check status and nonce atomically
         if self.status != expected_status || self.nonce != expected_nonce {
             msg!(
                 "CAS failed: expected status={:?}, nonce={}, got status={:?}, nonce={}",
@@ -315,12 +319,14 @@ impl GameSession {
                 self.status,
                 self.nonce
             );
-            self.locked = false;
-            self.current_operation = None;
-            self.operation_started_at = 0;
             return Ok(false);
         }
 
+        // Set operation tracking
+        self.current_operation = operation_type.map(|s| s.to_string());
+        self.operation_started_at = current_time;
+
+        // Validate state transition
         require!(
             self.status.can_transition_to(&new_status),
             WagerError::InvalidGameState
@@ -347,7 +353,6 @@ impl GameSession {
             GameStatus::Completed => {
                 if matches!(self.distribution_status, DistributionStatus::InProgress) {
                     self.distribution_status = DistributionStatus::Completed;
-                    self.locked = false;
                     self.current_operation = None;
                     self.operation_started_at = 0;
                 }
@@ -355,7 +360,6 @@ impl GameSession {
             GameStatus::Cancelled | GameStatus::Expired => {
                 if matches!(self.distribution_status, DistributionStatus::InProgress) {
                     self.distribution_status = DistributionStatus::Failed;
-                    self.locked = false;
                     self.current_operation = None;
                     self.operation_started_at = 0;
                 }
@@ -369,12 +373,11 @@ impl GameSession {
             .ok_or(WagerError::ArithmeticError)?;
         self.check_rate_limit()?;
 
-        // Unlock after successful update unless it's a long-running operation
+        // Clear operation tracking for non-long-running operations
         if !matches!(
             new_status,
             GameStatus::DistributionInProgress | GameStatus::RefundInProgress
         ) {
-            self.locked = false;
             self.current_operation = None;
             self.operation_started_at = 0;
         }
@@ -438,7 +441,6 @@ impl GameSession {
         self.last_distribution_attempt = 0;
         self.current_operation = None;
         self.operation_started_at = 0;
-        self.locked = false;
         Ok(())
     }
 
@@ -470,7 +472,7 @@ impl GameSession {
         );
         let clock = Clock::get()?;
         self.current_operation = None;
-        self.locked = false;
+        self.operation_started_at = 0;
         self.distribution_status = DistributionStatus::Completed;
         if self.status != GameStatus::Completed {
             self.status = GameStatus::Completed;
@@ -487,7 +489,7 @@ impl GameSession {
     pub fn mark_distribution_failed(&mut self) -> Result<()> {
         let clock = Clock::get()?;
         self.current_operation = None;
-        self.locked = false;
+        self.operation_started_at = 0;
         self.distribution_status = DistributionStatus::Failed;
         self.last_distribution_attempt = clock.unix_timestamp;
         self.status = GameStatus::Cancelled;
@@ -819,7 +821,7 @@ impl GameSession {
         if !matches!(self.distribution_status, DistributionStatus::NotStarted) {
             return Ok(false);
         }
-        if self.current_operation.is_some() || self.locked {
+        if self.current_operation.is_some() {
             return Ok(false);
         }
         if !self.check_all_filled_secure()? {
@@ -838,12 +840,14 @@ impl GameSession {
 
         // Define different timeouts for different operations
         let timeout_duration = match self.current_operation.as_deref() {
-            Some(op) if op.contains("distribution") || op.contains("refund") => 300, // 5 minutes for critical operations
-            _ => 120, // 2 minutes for others
+            Some(op) if op.contains("distribution") || op.contains("refund") => 300, // 5 minutes
+            _ => 120,                                                                // 2 minutes
         };
 
-        // Check if lock is active and not timed out
-        if self.locked && current_time - self.operation_started_at < timeout_duration {
+        // Check if operation is active and not timed out
+        if self.current_operation.is_some()
+            && current_time - self.operation_started_at < timeout_duration
+        {
             msg!(
                 "Cannot clear lock: operation={:?} in progress, time remaining={}s",
                 self.current_operation,
@@ -852,8 +856,7 @@ impl GameSession {
             return Err(error!(WagerError::ConcurrentOperation));
         }
 
-        // Clear the lock
-        self.locked = false;
+        // Clear the operation
         self.current_operation = None;
         self.operation_started_at = 0;
         msg!(
@@ -871,7 +874,7 @@ impl GameSession {
         );
         let clock = Clock::get()?;
         self.current_operation = None;
-        self.locked = false;
+        self.operation_started_at = 0;
         self.status = GameStatus::Cancelled;
         self.last_operation = clock.unix_timestamp;
         msg!(
@@ -885,7 +888,7 @@ impl GameSession {
     pub fn mark_refund_failed(&mut self) -> Result<()> {
         let clock = Clock::get()?;
         self.current_operation = None;
-        self.locked = false;
+        self.operation_started_at = 0;
         self.last_operation = clock.unix_timestamp;
         msg!(
             "Refund marked as failed at {} for session_id={}",
@@ -917,10 +920,6 @@ impl GameSession {
         require!(
             self.session_hash == expected_hash,
             WagerError::SessionIdCollision
-        );
-        require!(
-            !self.locked || self.current_operation.is_some(),
-            WagerError::GameDataCorruption
         );
         Ok(())
     }
@@ -958,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_and_swap_status_concurrent_lock() {
+    fn test_compare_and_swap_status_concurrent() {
         let mut game_session = GameSession {
             session_id: "test_session".to_string(),
             authority: Pubkey::new_unique(),
@@ -982,7 +981,6 @@ mod tests {
             last_distribution_attempt: 0,
             current_operation: None,
             operation_started_at: 0,
-            locked: false,
         };
 
         // Test successful CAS
@@ -996,13 +994,12 @@ mod tests {
         assert!(result.unwrap());
         assert_eq!(game_session.status, GameStatus::InProgress);
         assert_eq!(game_session.nonce, 101);
-        assert!(game_session.locked);
         assert_eq!(
             game_session.current_operation,
             Some("test_transition".to_string())
         );
 
-        // Test concurrent CAS attempt (should fail due to lock)
+        // Test concurrent CAS attempt (should fail due to active operation)
         let result = game_session.compare_and_swap_status(
             GameStatus::InProgress,
             101,
@@ -1018,7 +1015,6 @@ mod tests {
         assert_eq!(game_session.nonce, 101);
 
         // Test failed CAS due to wrong status
-        game_session.locked = false;
         game_session.current_operation = None;
         game_session.operation_started_at = 0;
         let result = game_session.compare_and_swap_status(
@@ -1031,7 +1027,10 @@ mod tests {
         assert!(!result.unwrap());
         assert_eq!(game_session.status, GameStatus::InProgress);
         assert_eq!(game_session.nonce, 101);
-        assert!(!game_session.locked);
+        assert_eq!(
+            game_session.current_operation,
+            Some("test_fail".to_string())
+        );
     }
 
     #[test]
@@ -1059,10 +1058,9 @@ mod tests {
             last_distribution_attempt: 0,
             current_operation: Some("distribution".to_string()),
             operation_started_at: 1234567890,
-            locked: true,
         };
 
-        // Test clearing lock before timeout (should fail)
+        // Test clearing operation before timeout (should fail)
         let result = game_session.clear_operation_lock(game_session.authority);
         assert!(result.is_err());
         assert_eq!(
@@ -1074,7 +1072,6 @@ mod tests {
         game_session.operation_started_at = 1234567890 - 300;
         let result = game_session.clear_operation_lock(game_session.authority);
         assert!(result.is_ok());
-        assert!(!game_session.locked);
         assert_eq!(game_session.current_operation, None);
         assert_eq!(game_session.operation_started_at, 0);
 
